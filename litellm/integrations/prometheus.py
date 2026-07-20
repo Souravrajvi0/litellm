@@ -3930,20 +3930,54 @@ class PrometheusLogger(CustomLogger):
             )
 
     @staticmethod
+    def _metrics_endpoint_already_registered(app: object) -> bool:
+        from starlette.routing import Mount, Route
+
+        for route in getattr(app, "routes", ()):
+            path = getattr(route, "path", None)
+            if path not in ("/metrics", "/metrics/"):
+                continue
+            if isinstance(route, (Route, Mount)):
+                return True
+        return False
+
+    @staticmethod
+    def _prometheus_metrics_route_handler(metrics_app: object) -> object:
+        from starlette.types import Receive, Scope, Send
+
+        class _PrometheusMetricsASGI:
+            def __init__(self, inner_app: object) -> None:
+                self._inner_app = inner_app
+
+            async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+                if scope["type"] != "http":
+                    await self._inner_app(scope, receive, send)  # pyright: ignore[reportCallIssue] # ASGI callable
+                    return
+                metrics_scope = dict(scope)
+                metrics_scope["path"] = "/"
+                metrics_scope["root_path"] = (scope.get("root_path") or "") + "/metrics"
+                await self._inner_app(metrics_scope, receive, send)  # pyright: ignore[reportCallIssue] # ASGI callable
+
+        return _PrometheusMetricsASGI(metrics_app)
+
+    @staticmethod
     def _mount_metrics_endpoint():
         """
-        Mount the Prometheus metrics endpoint with optional authentication.
+        Register the Prometheus metrics endpoint with optional authentication.
 
-        Args:
-            require_auth (bool, optional): Whether to require authentication for the metrics endpoint.
-                                        Defaults to False.
+        Uses explicit ASGI routes at /metrics (and /metrics/ for compatibility)
+        instead of app.mount so Prometheus scrapes are not redirected to a
+        trailing-slash URL.
         """
         from prometheus_client import make_asgi_app
+        from starlette.routing import Route
 
         from litellm._logging import verbose_proxy_logger
         from litellm.proxy.proxy_server import app
 
-        # Create metrics ASGI app
+        if PrometheusLogger._metrics_endpoint_already_registered(app):
+            return
+
         if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
             from prometheus_client import CollectorRegistry, multiprocess
 
@@ -3953,8 +3987,9 @@ class PrometheusLogger(CustomLogger):
         else:
             metrics_app = make_asgi_app()
 
-        # Mount the metrics app to the app
-        app.mount("/metrics", metrics_app)
+        handler = PrometheusLogger._prometheus_metrics_route_handler(metrics_app)
+        app.routes.append(Route("/metrics", endpoint=handler, methods=["GET", "HEAD"]))
+        app.routes.append(Route("/metrics/", endpoint=handler, methods=["GET", "HEAD"]))
         verbose_proxy_logger.debug("Starting Prometheus Metrics on /metrics (no authentication)")
 
 

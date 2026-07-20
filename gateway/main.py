@@ -35,9 +35,10 @@ from gateway.routes.allowlist import (
 def _is_gateway_route(route) -> bool:
     """Keep the route on the gateway if its path is in the LLM data-plane surface.
 
-    Prometheus registers /metrics as a Mount (``app.mount("/metrics", make_asgi_app())``),
-    so Mounts are matched against GATEWAY_MOUNT_PATHS instead of being dropped with
-    the UI static mounts.
+    Prometheus registers /metrics as explicit ASGI routes (not a Mount) so
+    scrapes to /metrics are not redirected to /metrics/. Mounts are matched
+    against GATEWAY_MOUNT_PATHS instead of being dropped with the UI static
+    mounts.
     """
     path = getattr(route, "path", None)
     if path is None:

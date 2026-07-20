@@ -59,6 +59,7 @@ from gateway.routes.allowlist import (
     GATEWAY_MOUNT_PATHS,
     GATEWAY_PATH_PREFIXES,
 )
+from litellm.integrations.prometheus import PrometheusLogger
 from litellm.proxy.proxy_server import app
 
 for _key, _previous in _PRE_EXISTING_ENV.items():
@@ -165,27 +166,33 @@ def test_backend_drops_non_allowlisted_mounts():
 
 
 def test_gateway_mount_paths_defined():
-    """GATEWAY_MOUNT_PATHS constant must exist and expose /metrics."""
+    """GATEWAY_MOUNT_PATHS constant must exist (may be empty when no Mounts are gateway-scoped)."""
     assert isinstance(GATEWAY_MOUNT_PATHS, frozenset), \
         f"GATEWAY_MOUNT_PATHS must be a frozenset, got {type(GATEWAY_MOUNT_PATHS)}"
-    assert "/metrics" in GATEWAY_MOUNT_PATHS, \
-        "/metrics Mount path must be in GATEWAY_MOUNT_PATHS"
+    assert "/metrics" in GATEWAY_EXACT_PATHS, \
+        "/metrics route path must be in GATEWAY_EXACT_PATHS"
 
 
-def test_gateway_trim_keeps_metrics_mount():
-    """The Prometheus /metrics Mount must survive the gateway route trim.
+def test_gateway_trim_keeps_metrics_route():
+    """The Prometheus /metrics route must survive the gateway route trim.
 
     Regression test for https://github.com/BerriAI/litellm/issues/30291:
     ``_is_gateway_route`` used to reject every Mount before the allowlist
-    check, so the /metrics Mount registered by
+    check, so the /metrics endpoint registered by
     ``PrometheusLogger._mount_metrics_endpoint()`` was dropped at startup and
     the gateway returned 404 on /metrics.
     """
-    metrics_mount = Mount("/metrics", app=make_asgi_app())
-    routes = [*app.router.routes, metrics_mount]
+    from starlette.routing import Route
+
+    metrics_route = Route(
+        "/metrics",
+        endpoint=PrometheusLogger._prometheus_metrics_route_handler(make_asgi_app()),
+        methods=["GET", "HEAD"],
+    )
+    routes = [*app.router.routes, metrics_route]
     trimmed = [r for r in routes if _is_gateway_route(r)]
-    assert metrics_mount in trimmed, \
-        "/metrics Mount must survive the gateway route trim"
+    assert metrics_route in trimmed, \
+        "/metrics route must survive the gateway route trim"
 
 
 def test_gateway_drops_ui_and_swagger_mounts():
@@ -201,11 +208,10 @@ def test_every_app_mount_is_assigned_to_a_component():
     A Mount must be kept by the gateway (GATEWAY_MOUNT_PATHS), kept by the
     backend (BACKEND_MOUNT_PATHS), or be a static mount served by the
     dedicated UI container. A Mount matching none of these is unreachable in
-    a componentized deployment, which is exactly how the /metrics Mount was
-    silently dropped.
+    a componentized deployment.
     """
     ui_served_prefixes = ("/ui", "/_next", "/litellm-asset-prefix")
-    mounts = [*app.router.routes, Mount("/metrics", app=make_asgi_app())]
+    mounts = [r for r in app.router.routes if isinstance(r, Mount)]
     unassigned = {
         path
         for r in mounts
