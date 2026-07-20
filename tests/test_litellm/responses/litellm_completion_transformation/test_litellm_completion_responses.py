@@ -2811,3 +2811,168 @@ def test_function_call_tool_id_falls_back_to_unique_id_for_degenerate_call_id():
         id="fc_2", call_id="call_tokyo", name="get_weather", arguments="{}"
     )
     assert convert(openai)["id"] == "call_tokyo"
+
+
+class TestAnthropicServerWebSearchResponsesBridge:
+    """Regression for https://github.com/BerriAI/litellm/issues/33546
+
+    Anthropic/Vertex native web_search arrives as chat tool_calls with srvtoolu_*
+    ids. Emitting those as Responses function_call items breaks multi-turn
+    replay: clients either replay the bare function_call (Anthropic 400:
+    server_tool_use without web_search_tool_result) or invent a
+    function_call_output (Anthropic 400: unexpected tool_use_id).
+    """
+
+    _SRVTOOLU_ID = "srvtoolu_vrtx_01DCSEZGoMvexECVdEq3vhJ3"
+
+    def _chat_response_with_server_web_search(self) -> ModelResponse:
+        return ModelResponse(
+            id="chatcmpl-test",
+            choices=[
+                Choices(
+                    finish_reason="tool_calls",
+                    index=0,
+                    message=Message(
+                        role="assistant",
+                        content="Bitcoin is about $100k.",
+                        tool_calls=[
+                            ChatCompletionMessageToolCall(
+                                id=self._SRVTOOLU_ID,
+                                type="function",
+                                function=Function(
+                                    name="web_search",
+                                    arguments='{"query": "bitcoin price today"}',
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            ],
+        )
+
+    def test_server_web_search_emitted_as_web_search_call_not_function_call(self):
+        tools = LiteLLMCompletionResponsesConfig.transform_chat_completion_tools_to_responses_tools(
+            chat_completion_response=self._chat_response_with_server_web_search(),
+        )
+        assert len(tools) == 1
+        item = tools[0]
+        assert getattr(item, "type", None) == "web_search_call"
+        assert getattr(item, "id", None) == self._SRVTOOLU_ID
+        assert getattr(item, "status", None) == "completed"
+        action = getattr(item, "action", None)
+        assert action is not None
+        assert getattr(action, "type", None) == "search"
+        assert getattr(action, "query", None) == "bitcoin price today"
+
+    def test_regular_function_call_unchanged(self):
+        response = ModelResponse(
+            id="chatcmpl-test",
+            choices=[
+                Choices(
+                    finish_reason="tool_calls",
+                    index=0,
+                    message=Message(
+                        role="assistant",
+                        content=None,
+                        tool_calls=[
+                            ChatCompletionMessageToolCall(
+                                id="toolu_01RegularCall",
+                                type="function",
+                                function=Function(
+                                    name="get_weather",
+                                    arguments='{"location": "SF"}',
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            ],
+        )
+        tools = LiteLLMCompletionResponsesConfig.transform_chat_completion_tools_to_responses_tools(
+            chat_completion_response=response,
+        )
+        assert len(tools) == 1
+        assert getattr(tools[0], "type", None) == "function_call"
+        assert getattr(tools[0], "call_id", None) == "toolu_01RegularCall"
+
+    def test_replay_drops_web_search_call_and_legacy_srvtoolu_function_call(self):
+        user1 = {
+            "type": "message",
+            "role": "user",
+            "content": "Find bitcoin price",
+        }
+        web_search_call = {
+            "type": "web_search_call",
+            "id": self._SRVTOOLU_ID,
+            "status": "completed",
+            "action": {"type": "search", "query": "bitcoin price today"},
+        }
+        assistant_text = {
+            "type": "message",
+            "role": "assistant",
+            "content": "Bitcoin is about $100k.",
+        }
+        legacy_function_call = {
+            "type": "function_call",
+            "call_id": self._SRVTOOLU_ID,
+            "id": self._SRVTOOLU_ID,
+            "name": "web_search",
+            "arguments": '{"query": "bitcoin price today"}',
+            "status": "completed",
+        }
+        legacy_function_call_output = {
+            "type": "function_call_output",
+            "call_id": self._SRVTOOLU_ID,
+            "output": '{"results": []}',
+        }
+        user2 = {
+            "type": "message",
+            "role": "user",
+            "content": "thanks, now just say hi",
+        }
+
+        messages = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
+            input=[user1, web_search_call, assistant_text, user2],
+            responses_api_request={},
+        )
+        assert [m.get("role") if isinstance(m, dict) else getattr(m, "role", None) for m in messages] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+        for message in messages:
+            tool_calls = (
+                message.get("tool_calls")
+                if isinstance(message, dict)
+                else getattr(message, "tool_calls", None)
+            )
+            assert not tool_calls
+
+        legacy_messages = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
+            input=[user1, legacy_function_call, legacy_function_call_output, assistant_text, user2],
+            responses_api_request={},
+        )
+        roles = [
+            m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+            for m in legacy_messages
+        ]
+        assert "tool" not in roles
+        assert roles.count("user") == 2
+        assert roles.count("assistant") >= 1
+        for message in legacy_messages:
+            tool_calls = (
+                message.get("tool_calls")
+                if isinstance(message, dict)
+                else getattr(message, "tool_calls", None)
+            )
+            if not tool_calls:
+                continue
+            for tool_call in tool_calls:
+                tool_id = (
+                    tool_call.get("id")
+                    if isinstance(tool_call, dict)
+                    else getattr(tool_call, "id", None)
+                )
+                assert not (
+                    isinstance(tool_id, str) and tool_id.startswith("srvtoolu_")
+                )

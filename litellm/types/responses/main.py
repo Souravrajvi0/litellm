@@ -67,6 +67,27 @@ class OutputCodeInterpreterCall(BaseLiteLLMOpenAIResponseObject):
     outputs: Optional[List[OutputCodeInterpreterCallLog]]
 
 
+class OutputWebSearchCallAction(BaseLiteLLMOpenAIResponseObject):
+    """Search action for a Responses API web_search_call item"""
+
+    type: Literal["search"]
+    query: Optional[str] = None
+
+
+class OutputWebSearchCall(BaseLiteLLMOpenAIResponseObject):
+    """A server-side web search call surfaced in Responses API output.
+
+    Anthropic/Vertex native web_search arrives as chat tool_calls with
+    srvtoolu_* ids. Emitting those as generic function_call items breaks
+    multi-turn replay (clients treat them as unanswered function calls).
+    """
+
+    type: Literal["web_search_call"]
+    id: str
+    status: Literal["in_progress", "completed", "incomplete", "failed"]
+    action: Optional[OutputWebSearchCallAction] = None
+
+
 def build_code_interpreter_log_outputs(
     content: Any,
 ) -> Optional[List[OutputCodeInterpreterCallLog]]:

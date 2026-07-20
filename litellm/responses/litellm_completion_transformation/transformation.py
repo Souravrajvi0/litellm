@@ -54,6 +54,8 @@ from litellm.types.responses.main import (
     OutputFunctionToolCall,
     OutputImageGenerationCall,
     OutputText,
+    OutputWebSearchCall,
+    OutputWebSearchCallAction,
 )
 from litellm.types.utils import (
     ChatCompletionAnnotation,
@@ -879,6 +881,8 @@ class LiteLLMCompletionResponsesConfig:
         - ResponseReasoningItemParam
         - ItemReference
         """
+        if LiteLLMCompletionResponsesConfig._should_drop_server_side_web_search_input_item(input_item):
+            return []
         if LiteLLMCompletionResponsesConfig._is_input_item_tool_call_output(input_item):
             # handle executed tool call results
             return (
@@ -1364,15 +1368,88 @@ class LiteLLMCompletionResponsesConfig:
         return result
 
     @staticmethod
+    def _is_anthropic_server_tool_id(tool_id: str | None) -> bool:
+        return bool(tool_id) and tool_id.startswith("srvtoolu_")
+
+    @staticmethod
+    def _is_web_search_tool_name(tool_name: str | None) -> bool:
+        if not tool_name:
+            return False
+        return tool_name == "web_search" or tool_name.startswith("web_search_")
+
+    @staticmethod
+    def _web_search_query_from_arguments(tool_arguments: str) -> str | None:
+        if not tool_arguments:
+            return None
+        try:
+            parsed = json.loads(tool_arguments)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        query = parsed.get("query")
+        return query if isinstance(query, str) and query else None
+
+    @staticmethod
+    def _build_web_search_call_output_item(
+        *,
+        tool_id: str,
+        tool_arguments: str,
+        status: str | None,
+    ) -> OutputWebSearchCall:
+        query = LiteLLMCompletionResponsesConfig._web_search_query_from_arguments(tool_arguments)
+        action = OutputWebSearchCallAction(type="search", query=query) if query is not None else None
+        status_map: dict[str, Literal["in_progress", "completed", "incomplete", "failed"]] = {
+            "in_progress": "in_progress",
+            "completed": "completed",
+            "incomplete": "incomplete",
+            "failed": "failed",
+        }
+        normalized_status = status_map.get(status or "", "completed")
+        return OutputWebSearchCall(
+            type="web_search_call",
+            id=tool_id,
+            status=normalized_status,
+            action=action,
+        )
+
+    @staticmethod
+    def _should_drop_server_side_web_search_input_item(input_item: Any) -> bool:
+        """Drop Anthropic/Vertex server web_search items on Responses→chat replay.
+
+        OpenAI clients (e.g. Codex) replay prior output items. Surfacing native
+        web_search as function_call/function_call_output, or replaying
+        web_search_call as a chat tool message, produces orphaned
+        server_tool_use / tool_result blocks that Anthropic rejects with 400.
+        """
+        if not isinstance(input_item, dict):
+            return False
+        item_type = input_item.get("type")
+        if item_type == "web_search_call":
+            return True
+        call_id = input_item.get("call_id") or input_item.get("id")
+        if not LiteLLMCompletionResponsesConfig._is_anthropic_server_tool_id(
+            str(call_id) if call_id is not None else None
+        ):
+            return False
+        if item_type == "function_call":
+            return True
+        if item_type in ("function_call_output", "tool_result"):
+            return True
+        return False
+
+    @staticmethod
     def transform_chat_completion_tools_to_responses_tools(
         chat_completion_response: ModelResponse,
         responses_api_request: ResponsesAPIOptionalRequestParams | None = None,
-    ) -> list[ResponseFunctionToolCall | CustomToolCallOutputItem]:
+    ) -> list[ResponseFunctionToolCall | CustomToolCallOutputItem | OutputWebSearchCall]:
         """
         Transform a Chat Completion tools into a Responses API tools.
 
         For custom tools (e.g. apply_patch), returns CustomToolCallOutputItem
-        with ``type="custom_tool_call"``. For regular function tools, returns
+        with ``type="custom_tool_call"``. For Anthropic/Vertex native web_search
+        (srvtoolu_* ids), returns ``OutputWebSearchCall`` with
+        ``type="web_search_call"``. For regular function tools, returns
         ``ResponseFunctionToolCall`` with ``type="function_call"``.
         """
         all_chat_completion_tools: list[ChatCompletionMessageToolCall] = []
@@ -1391,7 +1468,7 @@ class LiteLLMCompletionResponsesConfig:
         if responses_api_request and "tools" in responses_api_request:
             custom_tool_names = extract_custom_tool_names(responses_api_request["tools"])
 
-        responses_tools: list[ResponseFunctionToolCall | CustomToolCallOutputItem] = []
+        responses_tools: list[ResponseFunctionToolCall | CustomToolCallOutputItem | OutputWebSearchCall] = []
         for tool in all_chat_completion_tools:
             if tool.type == "function":
                 function_definition = tool.function
@@ -1412,6 +1489,16 @@ class LiteLLMCompletionResponsesConfig:
                         status=function_definition.get("status") or "completed",
                     )
                     responses_tools.append(custom_item)
+                elif LiteLLMCompletionResponsesConfig._is_anthropic_server_tool_id(
+                    tool_id
+                ) and LiteLLMCompletionResponsesConfig._is_web_search_tool_name(tool_name):
+                    responses_tools.append(
+                        LiteLLMCompletionResponsesConfig._build_web_search_call_output_item(
+                            tool_id=tool_id,
+                            tool_arguments=tool_arguments,
+                            status=function_definition.get("status"),
+                        )
+                    )
                 else:
                     # Build regular function_call output item
                     provider_specific_fields: dict | None = None
@@ -1654,6 +1741,7 @@ class LiteLLMCompletionResponsesConfig:
         | OutputImageGenerationCall
         | ResponseFunctionToolCall
         | CustomToolCallOutputItem
+        | OutputWebSearchCall
     ]:
         responses_output: list[
             GenericResponseOutputItem
@@ -1662,6 +1750,7 @@ class LiteLLMCompletionResponsesConfig:
             | OutputImageGenerationCall
             | ResponseFunctionToolCall
             | CustomToolCallOutputItem
+            | OutputWebSearchCall
         ] = []
 
         responses_output.extend(
