@@ -801,6 +801,20 @@ class DBSpendUpdateWriter:
         ):
             verbose_proxy_logger.debug("acquired lock for spend updates")
 
+            committed_db_buckets: list[str] = []
+            db_spend_fully_committed = False
+            daily_user_committed = False
+            daily_team_committed = False
+            daily_org_committed = False
+            daily_end_user_committed = False
+            daily_agent_committed = False
+            db_spend_update_transactions = None
+            daily_spend_update_transactions = None
+            daily_team_spend_update_transactions = None
+            daily_org_spend_update_transactions = None
+            daily_end_user_spend_update_transactions = None
+            daily_agent_spend_update_transactions = None
+
             try:
                 (
                     db_spend_update_transactions,
@@ -829,7 +843,9 @@ class DBSpendUpdateWriter:
                         n_retry_times=n_retry_times,
                         proxy_logging_obj=proxy_logging_obj,
                         db_spend_update_transactions=db_spend_update_transactions,
+                        committed_entity_buckets=committed_db_buckets,
                     )
+                    db_spend_fully_committed = True
 
                 if daily_spend_update_transactions is not None:
                     await DBSpendUpdateWriter.update_daily_user_spend(
@@ -838,6 +854,7 @@ class DBSpendUpdateWriter:
                         proxy_logging_obj=proxy_logging_obj,
                         daily_spend_transactions=daily_spend_update_transactions,
                     )
+                    daily_user_committed = True
                 if daily_team_spend_update_transactions is not None:
                     await DBSpendUpdateWriter.update_daily_team_spend(
                         n_retry_times=n_retry_times,
@@ -845,6 +862,7 @@ class DBSpendUpdateWriter:
                         proxy_logging_obj=proxy_logging_obj,
                         daily_spend_transactions=daily_team_spend_update_transactions,
                     )
+                    daily_team_committed = True
 
                 if daily_org_spend_update_transactions is not None:
                     await DBSpendUpdateWriter.update_daily_org_spend(
@@ -853,6 +871,7 @@ class DBSpendUpdateWriter:
                         proxy_logging_obj=proxy_logging_obj,
                         daily_spend_transactions=daily_org_spend_update_transactions,
                     )
+                    daily_org_committed = True
 
                 if daily_end_user_spend_update_transactions is not None:
                     await DBSpendUpdateWriter.update_daily_end_user_spend(
@@ -861,6 +880,7 @@ class DBSpendUpdateWriter:
                         proxy_logging_obj=proxy_logging_obj,
                         daily_spend_transactions=daily_end_user_spend_update_transactions,
                     )
+                    daily_end_user_committed = True
                 if daily_agent_spend_update_transactions is not None:
                     await DBSpendUpdateWriter.update_daily_agent_spend(
                         n_retry_times=n_retry_times,
@@ -868,10 +888,35 @@ class DBSpendUpdateWriter:
                         proxy_logging_obj=proxy_logging_obj,
                         daily_spend_transactions=daily_agent_spend_update_transactions,
                     )
+                    daily_agent_committed = True
             except Exception as e:
+                db_spend_to_restore = (
+                    None
+                    if db_spend_fully_committed or db_spend_update_transactions is None
+                    else self.redis_update_buffer._db_spend_without_committed_buckets(
+                        db_spend_update_transactions,
+                        frozenset(committed_db_buckets),
+                    )
+                )
+                await self.redis_update_buffer.restore_dequeued_spend_updates_to_redis_buffer(
+                    db_spend_update_transactions=db_spend_to_restore,
+                    daily_spend_update_transactions=(None if daily_user_committed else daily_spend_update_transactions),
+                    daily_team_spend_update_transactions=(
+                        None if daily_team_committed else daily_team_spend_update_transactions
+                    ),
+                    daily_org_spend_update_transactions=(
+                        None if daily_org_committed else daily_org_spend_update_transactions
+                    ),
+                    daily_end_user_spend_update_transactions=(
+                        None if daily_end_user_committed else daily_end_user_spend_update_transactions
+                    ),
+                    daily_agent_spend_update_transactions=(
+                        None if daily_agent_committed else daily_agent_spend_update_transactions
+                    ),
+                )
                 spend_log_error(
                     "Spend tracking - failed to commit spend updates from Redis to DB. "
-                    "Data already popped from Redis may be lost. Error: %s",
+                    "Restored dequeued payloads to Redis for retry. Error: %s",
                     str(e),
                     exc=e,
                 )
@@ -1068,6 +1113,7 @@ class DBSpendUpdateWriter:
         n_retry_times: int,
         proxy_logging_obj: ProxyLogging,
         db_spend_update_transactions: DBSpendUpdateTransactions,
+        committed_entity_buckets: list[str] | None = None,
     ):
         """
         Commits all the spend `UPDATE` transactions to the Database
@@ -1077,6 +1123,10 @@ class DBSpendUpdateWriter:
             ProxyUpdateSpend,
             _raise_failed_update_spend_exception,
         )
+
+        def _mark_bucket_committed(bucket: str) -> None:
+            if committed_entity_buckets is not None:
+                committed_entity_buckets.append(bucket)
 
         ### UPDATE USER TABLE ###
         user_list_transactions = db_spend_update_transactions["user_list_transactions"]
@@ -1109,6 +1159,7 @@ class DBSpendUpdateWriter:
                     _raise_failed_update_spend_exception(
                         e=e, start_time=start_time, proxy_logging_obj=proxy_logging_obj
                     )
+            _mark_bucket_committed("user_list_transactions")
 
         ### UPDATE END-USER TABLE ###
         end_user_list_transactions = db_spend_update_transactions["end_user_list_transactions"]
@@ -1120,6 +1171,7 @@ class DBSpendUpdateWriter:
                 proxy_logging_obj=proxy_logging_obj,
                 end_user_list_transactions=end_user_list_transactions,
             )
+            _mark_bucket_committed("end_user_list_transactions")
         ### UPDATE KEY TABLE ###
         key_list_transactions = db_spend_update_transactions["key_list_transactions"]
         verbose_proxy_logger.debug("KEY Spend transactions: {}".format(key_list_transactions))
@@ -1152,6 +1204,7 @@ class DBSpendUpdateWriter:
                     _raise_failed_update_spend_exception(
                         e=e, start_time=start_time, proxy_logging_obj=proxy_logging_obj
                     )
+            _mark_bucket_committed("key_list_transactions")
 
         ### UPDATE TEAM TABLE ###
         team_list_transactions = db_spend_update_transactions["team_list_transactions"]
@@ -1185,6 +1238,7 @@ class DBSpendUpdateWriter:
                     _raise_failed_update_spend_exception(
                         e=e, start_time=start_time, proxy_logging_obj=proxy_logging_obj
                     )
+            _mark_bucket_committed("team_list_transactions")
 
         ### UPDATE TEAM Membership TABLE with spend ###
         team_member_list_transactions = db_spend_update_transactions["team_member_list_transactions"]
@@ -1244,6 +1298,7 @@ class DBSpendUpdateWriter:
                         verbose_proxy_logger.debug(
                             f"Invalidated team membership cache for user_id={user_id}, team_id={team_id}"
                         )
+            _mark_bucket_committed("team_member_list_transactions")
 
         ### UPDATE ORG TABLE ###
         org_list_transactions = db_spend_update_transactions["org_list_transactions"]
@@ -1281,30 +1336,35 @@ class DBSpendUpdateWriter:
                     _raise_failed_update_spend_exception(
                         e=e, start_time=start_time, proxy_logging_obj=proxy_logging_obj
                     )
+            _mark_bucket_committed("org_list_transactions")
 
         ### UPDATE TAG TABLE ###
         tag_list_transactions = db_spend_update_transactions["tag_list_transactions"]
-        await DBSpendUpdateWriter._update_entity_spend_in_db(
-            entity_name="Tag",
-            transactions=tag_list_transactions,
-            table_accessor="litellm_tagtable",
-            where_field="tag_name",
-            n_retry_times=n_retry_times,
-            prisma_client=prisma_client,
-            proxy_logging_obj=proxy_logging_obj,
-        )
+        if tag_list_transactions is not None and len(tag_list_transactions.keys()) > 0:
+            await DBSpendUpdateWriter._update_entity_spend_in_db(
+                entity_name="Tag",
+                transactions=tag_list_transactions,
+                table_accessor="litellm_tagtable",
+                where_field="tag_name",
+                n_retry_times=n_retry_times,
+                prisma_client=prisma_client,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+            _mark_bucket_committed("tag_list_transactions")
 
         ### UPDATE AGENT TABLE ###
         agent_list_transactions = db_spend_update_transactions["agent_list_transactions"]
-        await DBSpendUpdateWriter._update_entity_spend_in_db(
-            entity_name="Agent",
-            transactions=agent_list_transactions,
-            table_accessor="litellm_agentstable",
-            where_field="agent_id",
-            n_retry_times=n_retry_times,
-            prisma_client=prisma_client,
-            proxy_logging_obj=proxy_logging_obj,
-        )
+        if agent_list_transactions is not None and len(agent_list_transactions.keys()) > 0:
+            await DBSpendUpdateWriter._update_entity_spend_in_db(
+                entity_name="Agent",
+                transactions=agent_list_transactions,
+                table_accessor="litellm_agentstable",
+                where_field="agent_id",
+                n_retry_times=n_retry_times,
+                prisma_client=prisma_client,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+            _mark_bucket_committed("agent_list_transactions")
 
     @staticmethod
     async def _update_entity_spend_in_db(

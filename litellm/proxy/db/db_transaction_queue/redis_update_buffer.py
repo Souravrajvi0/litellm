@@ -542,6 +542,96 @@ class RedisUpdateBuffer:
             cast(Optional[Dict[str, DailyAgentSpendTransaction]], daily_results[4]),
         )
 
+    @staticmethod
+    def _db_spend_without_committed_buckets(
+        transactions: DBSpendUpdateTransactions,
+        committed_buckets: frozenset[str],
+    ) -> DBSpendUpdateTransactions | None:
+        if not committed_buckets:
+            return transactions
+        stripped: DBSpendUpdateTransactions = {
+            "user_list_transactions": transactions.get("user_list_transactions"),
+            "end_user_list_transactions": transactions.get("end_user_list_transactions"),
+            "key_list_transactions": transactions.get("key_list_transactions"),
+            "team_list_transactions": transactions.get("team_list_transactions"),
+            "team_member_list_transactions": transactions.get("team_member_list_transactions"),
+            "org_list_transactions": transactions.get("org_list_transactions"),
+            "tag_list_transactions": transactions.get("tag_list_transactions"),
+            "agent_list_transactions": transactions.get("agent_list_transactions"),
+        }
+        for bucket in committed_buckets:
+            if bucket in stripped:
+                stripped[bucket] = {}
+        if not any(isinstance(v, dict) and len(v) > 0 for v in stripped.values()):
+            return None
+        return stripped
+
+    async def restore_dequeued_spend_updates_to_redis_buffer(
+        self,
+        db_spend_update_transactions: DBSpendUpdateTransactions | None,
+        daily_spend_update_transactions: dict[str, DailyUserSpendTransaction] | None,
+        daily_team_spend_update_transactions: dict[str, DailyTeamSpendTransaction] | None,
+        daily_org_spend_update_transactions: dict[str, DailyOrganizationSpendTransaction] | None,
+        daily_end_user_spend_update_transactions: dict[str, DailyEndUserSpendTransaction] | None,
+        daily_agent_spend_update_transactions: dict[str, DailyAgentSpendTransaction] | None,
+    ) -> None:
+        """
+        Put dequeued-but-uncommitted spend updates back into Redis for retry.
+
+        Called when the Redis-to-DB handoff raises after async_lpop_pipeline
+        removed the payloads. Without this, any transient DB outage permanently
+        loses buffered spend.
+        """
+        if self.redis_cache is None:
+            return
+
+        queue_configs: list[tuple[Any, str, ServiceTypes]] = [
+            (
+                db_spend_update_transactions,
+                REDIS_UPDATE_BUFFER_KEY,
+                ServiceTypes.REDIS_SPEND_UPDATE_QUEUE,
+            ),
+            (
+                daily_spend_update_transactions,
+                REDIS_DAILY_SPEND_UPDATE_BUFFER_KEY,
+                ServiceTypes.REDIS_DAILY_SPEND_UPDATE_QUEUE,
+            ),
+            (
+                daily_team_spend_update_transactions,
+                REDIS_DAILY_TEAM_SPEND_UPDATE_BUFFER_KEY,
+                ServiceTypes.REDIS_DAILY_TEAM_SPEND_UPDATE_QUEUE,
+            ),
+            (
+                daily_org_spend_update_transactions,
+                REDIS_DAILY_ORG_SPEND_UPDATE_BUFFER_KEY,
+                ServiceTypes.REDIS_DAILY_ORG_SPEND_UPDATE_QUEUE,
+            ),
+            (
+                daily_end_user_spend_update_transactions,
+                REDIS_DAILY_END_USER_SPEND_UPDATE_BUFFER_KEY,
+                ServiceTypes.REDIS_DAILY_END_USER_SPEND_UPDATE_QUEUE,
+            ),
+            (
+                daily_agent_spend_update_transactions,
+                REDIS_DAILY_AGENT_SPEND_UPDATE_BUFFER_KEY,
+                ServiceTypes.REDIS_DAILY_AGENT_SPEND_UPDATE_QUEUE,
+            ),
+        ]
+
+        for transactions, redis_key, service_type in queue_configs:
+            if transactions is None:
+                continue
+            if redis_key == REDIS_UPDATE_BUFFER_KEY:
+                if not any(isinstance(v, dict) and len(v) > 0 for v in transactions.values()):
+                    continue
+            elif len(transactions) == 0:
+                continue
+            await self._store_transactions_in_redis(
+                transactions=transactions,
+                redis_key=redis_key,
+                service_type=service_type,
+            )
+
     async def store_in_memory_daily_tag_spend_updates_in_redis(
         self,
         daily_tag_spend_update_queue: DailySpendUpdateQueue,

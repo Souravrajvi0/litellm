@@ -263,6 +263,62 @@ async def test_get_all_transactions_from_redis_buffer_pipeline(
 
 
 @pytest.mark.asyncio
+async def test_restore_dequeued_spend_updates_to_redis_buffer():
+    """Regression for #33872: dequeued spend must be pushed back to Redis on DB failure."""
+    from litellm.constants import REDIS_UPDATE_BUFFER_KEY
+
+    mock_redis_cache = AsyncMock()
+    mock_redis_cache.async_rpush = AsyncMock(return_value=2)
+    buffer = RedisUpdateBuffer(redis_cache=mock_redis_cache)
+
+    db_spend = {
+        "key_list_transactions": {"key-1": 1.5},
+        "user_list_transactions": {},
+        "end_user_list_transactions": {},
+        "team_list_transactions": {},
+        "team_member_list_transactions": {},
+        "org_list_transactions": {},
+        "tag_list_transactions": {},
+        "agent_list_transactions": {},
+    }
+
+    await buffer.restore_dequeued_spend_updates_to_redis_buffer(
+        db_spend_update_transactions=db_spend,
+        daily_spend_update_transactions=None,
+        daily_team_spend_update_transactions=None,
+        daily_org_spend_update_transactions=None,
+        daily_end_user_spend_update_transactions=None,
+        daily_agent_spend_update_transactions=None,
+    )
+
+    mock_redis_cache.async_rpush.assert_called_once()
+    call_kwargs = mock_redis_cache.async_rpush.call_args.kwargs
+    assert call_kwargs["key"] == REDIS_UPDATE_BUFFER_KEY
+    restored = json.loads(call_kwargs["values"][0])
+    assert restored["key_list_transactions"] == {"key-1": 1.5}
+
+
+def test_db_spend_without_committed_buckets_strips_applied_entities():
+    transactions = {
+        "user_list_transactions": {"user-a": 1.0},
+        "end_user_list_transactions": {},
+        "key_list_transactions": {"key-b": 2.0},
+        "team_list_transactions": {},
+        "team_member_list_transactions": {},
+        "org_list_transactions": {},
+        "tag_list_transactions": {},
+        "agent_list_transactions": {},
+    }
+    remaining = RedisUpdateBuffer._db_spend_without_committed_buckets(
+        transactions,
+        frozenset({"user_list_transactions"}),
+    )
+    assert remaining is not None
+    assert remaining["user_list_transactions"] == {}
+    assert remaining["key_list_transactions"] == {"key-b": 2.0}
+
+
+@pytest.mark.asyncio
 async def test_get_all_transactions_from_redis_buffer_pipeline_no_redis():
     """When redis_cache is None, should return all Nones"""
     buffer = RedisUpdateBuffer(redis_cache=None)

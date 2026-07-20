@@ -10,6 +10,7 @@ sys.path.insert(
 
 
 from datetime import datetime, timezone
+from typing import Any, List, Optional
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -1563,6 +1564,107 @@ async def test_commit_spend_updates_uses_pipeline():
     mock_redis_update_buffer.get_all_daily_end_user_spend_update_transactions_from_redis_buffer.assert_not_called()
     mock_redis_update_buffer.get_all_daily_agent_spend_update_transactions_from_redis_buffer.assert_not_called()
     mock_redis_update_buffer.get_all_daily_tag_spend_update_transactions_from_redis_buffer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_commit_spend_updates_restores_redis_on_db_failure():
+    """Regression for #33872: popped Redis spend is restored when DB commit fails."""
+    from litellm.constants import REDIS_UPDATE_BUFFER_KEY
+    from litellm.proxy.db.db_transaction_queue.redis_update_buffer import RedisUpdateBuffer
+
+    db_writer = DBSpendUpdateWriter()
+    mock_redis_cache = AsyncMock()
+    db_writer.redis_update_buffer = RedisUpdateBuffer(redis_cache=mock_redis_cache)
+    db_writer.redis_update_buffer.store_in_memory_spend_updates_in_redis = AsyncMock()
+
+    db_spend = {
+        "key_list_transactions": {"key-1": 1.5},
+        "user_list_transactions": {},
+        "end_user_list_transactions": {},
+        "team_list_transactions": {},
+        "team_member_list_transactions": {},
+        "org_list_transactions": {},
+        "tag_list_transactions": {},
+        "agent_list_transactions": {},
+    }
+    mock_redis_cache.async_lpop_pipeline = AsyncMock(
+        return_value=[[json.dumps(db_spend)], None, None, None, None, None]
+    )
+    mock_redis_cache.async_rpush = AsyncMock(return_value=1)
+
+    db_writer._commit_spend_updates_to_db = AsyncMock(
+        side_effect=RuntimeError("database unavailable after dequeue")
+    )
+    mock_pod_lock_manager = AsyncMock()
+    mock_pod_lock_manager.acquire_lock = AsyncMock(return_value=True)
+    mock_pod_lock_manager.release_lock = AsyncMock()
+    db_writer.pod_lock_manager = mock_pod_lock_manager
+
+    await db_writer._commit_spend_updates_to_db_with_redis(
+        prisma_client=MagicMock(),
+        n_retry_times=0,
+        proxy_logging_obj=MagicMock(),
+    )
+
+    mock_redis_cache.async_rpush.assert_called_once()
+    call_kwargs = mock_redis_cache.async_rpush.call_args.kwargs
+    assert call_kwargs["key"] == REDIS_UPDATE_BUFFER_KEY
+    restored_payload = json.loads(call_kwargs["values"][0])
+    assert restored_payload["key_list_transactions"] == {"key-1": 1.5}
+    mock_pod_lock_manager.release_lock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_commit_spend_updates_partial_db_failure_restores_only_uncommitted_buckets():
+    """After one entity bucket commits, only the remaining buckets are restored to Redis."""
+    from litellm.proxy.db.db_transaction_queue.redis_update_buffer import RedisUpdateBuffer
+
+    db_writer = DBSpendUpdateWriter()
+    mock_redis_cache = AsyncMock()
+    db_writer.redis_update_buffer = RedisUpdateBuffer(redis_cache=mock_redis_cache)
+    db_writer.redis_update_buffer.store_in_memory_spend_updates_in_redis = AsyncMock()
+
+    db_spend = {
+        "user_list_transactions": {"user-a": 1.0},
+        "end_user_list_transactions": {},
+        "key_list_transactions": {"key-b": 2.0},
+        "team_list_transactions": {},
+        "team_member_list_transactions": {},
+        "org_list_transactions": {},
+        "tag_list_transactions": {},
+        "agent_list_transactions": {},
+    }
+    mock_redis_cache.async_lpop_pipeline = AsyncMock(
+        return_value=[[json.dumps(db_spend)], None, None, None, None, None]
+    )
+    mock_redis_cache.async_rpush = AsyncMock(return_value=1)
+
+    async def _fail_after_user_commit(
+        *,
+        committed_entity_buckets: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> None:
+        if committed_entity_buckets is not None:
+            committed_entity_buckets.append("user_list_transactions")
+        raise RuntimeError("failed on key commit")
+
+    db_writer._commit_spend_updates_to_db = AsyncMock(side_effect=_fail_after_user_commit)
+    mock_pod_lock_manager = AsyncMock()
+    mock_pod_lock_manager.acquire_lock = AsyncMock(return_value=True)
+    mock_pod_lock_manager.release_lock = AsyncMock()
+    db_writer.pod_lock_manager = mock_pod_lock_manager
+
+    await db_writer._commit_spend_updates_to_db_with_redis(
+        prisma_client=MagicMock(),
+        n_retry_times=0,
+        proxy_logging_obj=MagicMock(),
+    )
+
+    restored_payload = json.loads(
+        mock_redis_cache.async_rpush.call_args.kwargs["values"][0]
+    )
+    assert restored_payload["user_list_transactions"] == {}
+    assert restored_payload["key_list_transactions"] == {"key-b": 2.0}
 
 
 @pytest.mark.parametrize(
