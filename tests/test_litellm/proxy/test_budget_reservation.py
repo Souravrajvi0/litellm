@@ -1563,6 +1563,53 @@ async def test_should_skip_reservation_when_counter_increment_fails(
 
 
 @pytest.mark.asyncio
+async def test_fail_closed_rejects_when_counter_increment_fails(
+    spend_counter_state,
+    monkeypatch,
+):
+    """
+    Regression for #33923: with fail_closed_budget_enforcement enabled, a
+    reservation infrastructure failure must reject with 503 instead of
+    degrading to read-time-only enforcement
+    """
+    from fastapi import HTTPException
+
+    counter_cache, key_cache = spend_counter_state
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=key_cache)
+    valid_token = UserAPIKeyAuth(
+        token="key-budget-reserve-unavailable-fail-closed",
+        spend=0.0,
+        max_budget=1.0,
+    )
+
+    async def fail_increment_cache(*args, **kwargs):
+        raise RuntimeError("counter unavailable")
+
+    monkeypatch.setattr(counter_cache, "async_increment_cache", fail_increment_cache)
+
+    with patch(
+        "litellm.proxy.spend_tracking.budget_reservation.estimate_request_max_cost",
+        return_value=0.5,
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await reserve_budget_for_request(
+                request_body=_request_body(),
+                route="/chat/completions",
+                llm_router=None,
+                valid_token=valid_token,
+                team_object=None,
+                user_object=None,
+                prisma_client=None,
+                user_api_key_cache=key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+                fail_closed_budget_enforcement=True,
+            )
+
+    assert exc.value.status_code == 503
+    assert "atomic budget reservation" in exc.value.detail["error"]
+
+
+@pytest.mark.asyncio
 async def test_should_skip_reservation_when_counter_initialization_fails(
     spend_counter_state,
 ):

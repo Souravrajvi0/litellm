@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, cast
 
+from fastapi import HTTPException, status
+
 import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.caching import DualCache
@@ -57,6 +59,24 @@ class _CounterReservationUnavailable(Exception):
         self.touched_counter = touched_counter
         self.counter_invalidated = counter_invalidated
         super().__init__("Counter reservation unavailable")
+
+
+def _raise_budget_reservation_unavailable() -> None:
+    verbose_proxy_logger.warning(
+        "fail_closed_budget_enforcement: rejecting request — atomic budget "
+        "reservation could not be written"
+    )
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "error": (
+                "Budget enforcement unavailable: atomic budget reservation "
+                "could not be written, and fail_closed_budget_enforcement "
+                "is enabled, so the request was rejected to avoid exceeding "
+                "the configured budget. Retry shortly."
+            )
+        },
+    )
 
 
 def get_reserved_counter_keys(budget_reservation: Optional[dict]) -> set:
@@ -138,6 +158,7 @@ async def reserve_budget_for_request(
     end_user_id: Optional[str] = None,
     end_user_object: Optional[Any] = None,
     skip_user_budget_on_team_key: bool = False,
+    fail_closed_budget_enforcement: bool = False,
 ) -> Optional[dict]:
     if valid_token is None or not RouteChecks.is_llm_api_route(route=route):
         return None
@@ -174,6 +195,7 @@ async def reserve_budget_for_request(
         return None
 
     applied_entries: List[Dict[str, Any]] = []
+    had_reservation_infrastructure_failure = False
     try:
         for counter in counters:
             entry = _counter_to_reservation_entry(
@@ -187,6 +209,7 @@ async def reserve_budget_for_request(
                     reservation_cost=reservation_cost,
                 )
             except _CounterReservationUnavailable as exc:
+                had_reservation_infrastructure_failure = True
                 if exc.touched_counter and not exc.counter_invalidated:
                     await _release_applied_entries_best_effort(
                         entries=[entry],
@@ -220,6 +243,8 @@ async def reserve_budget_for_request(
         raise
 
     if not applied_entries:
+        if had_reservation_infrastructure_failure and fail_closed_budget_enforcement:
+            _raise_budget_reservation_unavailable()
         return None
 
     input_cost = estimate_request_input_cost(request_body=request_body, route=route, llm_router=llm_router)
