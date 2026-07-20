@@ -698,6 +698,58 @@ def test_create_model_info_response_no_router_keeps_base_fields():
     }
 
 
+def test_create_model_info_response_uses_created_when_given():
+    response = create_model_info_response(
+        model_id="some-model",
+        provider="openai",
+        llm_router=None,
+        created=12345,
+        get_model_info=_raise_unmapped,
+    )
+    assert response["created"] == 12345
+
+
+def test_create_model_info_response_defaults_created_when_none():
+    from litellm.constants import DEFAULT_MODEL_CREATED_AT_TIME
+
+    response = create_model_info_response(
+        model_id="some-model",
+        provider="openai",
+        llm_router=None,
+        created=None,
+        get_model_info=_raise_unmapped,
+    )
+    assert response["created"] == DEFAULT_MODEL_CREATED_AT_TIME
+
+
+def test_resolve_model_provider_and_created_at_reads_deployment():
+    from datetime import datetime, timezone
+    from litellm.proxy.utils import resolve_model_provider_and_created_at
+
+    created_at = datetime(2024, 6, 1, tzinfo=timezone.utc)
+    deployment = MagicMock()
+    deployment.litellm_params.model = "anthropic/claude-3-5-sonnet-latest"
+    deployment.model_info.created_at = created_at
+
+    router = MagicMock()
+    router.get_deployment_by_model_group_name = MagicMock(return_value=deployment)
+
+    provider, created = resolve_model_provider_and_created_at(router, "claude-sonnet")
+    assert provider == "anthropic"
+    assert created == int(created_at.timestamp())
+
+
+def test_resolve_model_provider_and_created_at_falls_back_without_deployment():
+    from litellm.proxy.utils import resolve_model_provider_and_created_at
+
+    router = MagicMock()
+    router.get_deployment_by_model_group_name = MagicMock(return_value=None)
+
+    provider, created = resolve_model_provider_and_created_at(router, "wildcard-*")
+    assert provider == "openai"
+    assert created is None
+
+
 def test_create_model_info_response_reads_real_cost_map():
     response = create_model_info_response(
         model_id="gpt-4o", provider="openai", llm_router=None

@@ -6092,6 +6092,21 @@ async def get_available_models_for_user(
     return all_models
 
 
+def resolve_model_provider_and_created_at(llm_router: "Router | None", model_id: str) -> tuple[str, int | None]:
+    if llm_router is None:
+        return "openai", None
+    deployment = llm_router.get_deployment_by_model_group_name(model_id)
+    if deployment is None:
+        return "openai", None
+    try:
+        _, provider, _, _ = litellm.get_llm_provider(model=deployment.litellm_params.model)
+    except litellm.exceptions.BadRequestError:
+        provider = "openai"
+    created_at = deployment.model_info.created_at
+    created = int(created_at.timestamp()) if created_at is not None else None
+    return provider, created
+
+
 def create_model_info_response(
     model_id: str,
     provider: str,
@@ -6099,6 +6114,7 @@ def create_model_info_response(
     fallback_type: Optional[str] = None,
     llm_router: Optional["Router"] = None,
     get_model_info: Callable[[str], ModelInfo] = litellm.get_model_info,
+    created: int | None = None,
 ) -> ModelInfoResponse:
     """
     Create a standardized OpenAI-compatible model object.
@@ -6112,7 +6128,7 @@ def create_model_info_response(
     base: ModelInfoResponse = {
         "id": model_id,
         "object": "model",
-        "created": DEFAULT_MODEL_CREATED_AT_TIME,
+        "created": created if created is not None else DEFAULT_MODEL_CREATED_AT_TIME,
         "owned_by": provider,
     }
 
