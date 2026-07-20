@@ -8034,6 +8034,7 @@ class ProxyStartupEvent:
                     prisma_client=prisma_client,
                     llm_router=llm_router,
                     track_unmanaged_batch_cost=general_settings.get("track_unmanaged_batch_cost", False),
+                    pod_lock_manager=proxy_logging_obj.db_spend_update_writer.pod_lock_manager,
                 )
                 scheduler.add_job(
                     check_batch_cost_job.check_batch_cost,

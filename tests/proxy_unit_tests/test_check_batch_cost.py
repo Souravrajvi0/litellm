@@ -90,6 +90,62 @@ class TestCheckBatchCost:
         )
 
     @pytest.mark.asyncio
+    async def test_check_batch_cost_acquires_pod_lock(
+        self, mock_proxy_logging_obj, mock_prisma_client, mock_llm_router
+    ):
+        from litellm_enterprise.proxy.common_utils.check_batch_cost import (
+            CheckBatchCost,
+        )
+
+        mock_pod_lock_manager = MagicMock()
+        mock_pod_lock_manager.redis_cache = MagicMock()
+        mock_pod_lock_manager.acquire_lock = AsyncMock(return_value=True)
+        mock_pod_lock_manager.release_lock = AsyncMock()
+
+        checker = CheckBatchCost(
+            proxy_logging_obj=mock_proxy_logging_obj,
+            prisma_client=mock_prisma_client,
+            llm_router=mock_llm_router,
+            pod_lock_manager=mock_pod_lock_manager,
+        )
+        checker._check_batch_cost_locked = AsyncMock()
+
+        await checker.check_batch_cost()
+
+        mock_pod_lock_manager.acquire_lock.assert_awaited_once()
+        assert mock_pod_lock_manager.acquire_lock.call_args.kwargs["cronjob_id"] == "check_batch_cost_job"
+        checker._check_batch_cost_locked.assert_awaited_once()
+        mock_pod_lock_manager.release_lock.assert_awaited_once_with(
+            cronjob_id="check_batch_cost_job",
+        )
+
+    @pytest.mark.asyncio
+    async def test_check_batch_cost_skips_when_lock_not_acquired(
+        self, mock_proxy_logging_obj, mock_prisma_client, mock_llm_router
+    ):
+        from litellm_enterprise.proxy.common_utils.check_batch_cost import (
+            CheckBatchCost,
+        )
+
+        mock_pod_lock_manager = MagicMock()
+        mock_pod_lock_manager.redis_cache = MagicMock()
+        mock_pod_lock_manager.acquire_lock = AsyncMock(return_value=False)
+        mock_pod_lock_manager.release_lock = AsyncMock()
+
+        checker = CheckBatchCost(
+            proxy_logging_obj=mock_proxy_logging_obj,
+            prisma_client=mock_prisma_client,
+            llm_router=mock_llm_router,
+            pod_lock_manager=mock_pod_lock_manager,
+        )
+        checker._check_batch_cost_locked = AsyncMock()
+
+        await checker.check_batch_cost()
+
+        checker._check_batch_cost_locked.assert_not_awaited()
+        mock_pod_lock_manager.release_lock.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_cleanup_scoped_to_batch_file_purpose(
         self, check_batch_cost_instance, mock_prisma_client
     ):
@@ -278,7 +334,7 @@ class TestCheckBatchCost:
                 return_value=[{"id": "req-1"}],
             ),
             patch(
-                "litellm.batches.batch_utils.calculate_batch_cost_and_usage",
+                "litellm.batches.batch_utils.calculate_batch_cost_and_usage_from_file_bytes",
                 new_callable=AsyncMock,
                 return_value=(
                     0.01,
@@ -387,7 +443,7 @@ class TestCheckBatchCost:
                 return_value=[{"id": "req-1"}],
             ),
             patch(
-                "litellm.batches.batch_utils.calculate_batch_cost_and_usage",
+                "litellm.batches.batch_utils.calculate_batch_cost_and_usage_from_file_bytes",
                 new_callable=AsyncMock,
                 return_value=(
                     0.01,
@@ -648,7 +704,7 @@ class TestCheckBatchCost:
                 return_value=[{"id": "req-1"}],
             ),
             patch(
-                "litellm.batches.batch_utils.calculate_batch_cost_and_usage",
+                "litellm.batches.batch_utils.calculate_batch_cost_and_usage_from_file_bytes",
                 new_callable=AsyncMock,
                 return_value=(
                     0.01,
@@ -906,7 +962,7 @@ class TestUnmanagedVertexRouting:
                 return_value=[{"id": "req-1"}],
             ),
             patch(
-                "litellm.batches.batch_utils.calculate_batch_cost_and_usage",
+                "litellm.batches.batch_utils.calculate_batch_cost_and_usage_from_file_bytes",
                 new_callable=AsyncMock,
                 return_value=(
                     0.01,
@@ -1136,7 +1192,7 @@ class TestUnmanagedBedrockRouting:
                 return_value=[{"id": "req-1"}],
             ),
             patch(
-                "litellm.batches.batch_utils.calculate_batch_cost_and_usage",
+                "litellm.batches.batch_utils.calculate_batch_cost_and_usage_from_file_bytes",
                 new_callable=AsyncMock,
                 return_value=(
                     0.02,

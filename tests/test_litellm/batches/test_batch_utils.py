@@ -14,6 +14,7 @@ maps (litellm.completion_cost, batch_cost_calculator), the tokenizer
 deterministic stand-ins so the arithmetic under test is the only variable.
 """
 
+import json
 import os
 import sys
 
@@ -148,6 +149,49 @@ def test_parse_jsonl_empty_content_is_empty_list():
 def test_parse_jsonl_malformed_raises():
     with pytest.raises(Exception):
         bu._get_file_content_as_dictionary(b"not valid json")
+
+
+def test_get_file_content_as_dictionary_skips_json_dumps_when_debug_disabled(monkeypatch):
+    """Regression for #33955: debug logging must not re-serialize the full batch payload."""
+    from unittest.mock import patch
+
+    monkeypatch.setattr(bu.verbose_logger, "isEnabledFor", lambda _level: False)
+    with patch.object(bu.json, "dumps", side_effect=AssertionError("json.dumps must not run")):
+        assert bu._get_file_content_as_dictionary(b'{"a": 1}\n') == [{"a": 1}]
+
+
+@pytest.mark.asyncio
+async def test_calculate_batch_cost_and_usage_from_file_bytes_matches_list_path():
+    rows = [
+        {
+            "custom_id": "req-1",
+            "response": {
+                "status_code": 200,
+                "body": {
+                    "model": "gpt-4o",
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                        "total_tokens": 15,
+                    },
+                },
+            },
+        }
+    ]
+    raw = ("\n".join(json.dumps(row) for row in rows)).encode("utf-8")
+    list_cost, list_usage, list_models = await bu.calculate_batch_cost_and_usage(
+        file_content_dictionary=rows,
+        custom_llm_provider="openai",
+        model_name="gpt-4o",
+    )
+    stream_cost, stream_usage, stream_models = await bu.calculate_batch_cost_and_usage_from_file_bytes(
+        file_content=raw,
+        custom_llm_provider="openai",
+        model_name="gpt-4o",
+    )
+    assert stream_cost == list_cost
+    assert stream_usage.total_tokens == list_usage.total_tokens
+    assert stream_models == list_models
 
 
 # =========================================================================== #

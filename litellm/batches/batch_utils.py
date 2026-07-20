@@ -1,4 +1,6 @@
 import json
+import logging
+from collections.abc import Iterable
 from typing import Any, Iterator, List, Literal, Optional, Tuple
 
 import litellm
@@ -10,7 +12,7 @@ from litellm.utils import token_counter
 
 
 async def calculate_batch_cost_and_usage(
-    file_content_dictionary: List[dict],
+    file_content_dictionary: Iterable[dict],
     custom_llm_provider: Literal["openai", "azure", "vertex_ai", "hosted_vllm", "anthropic"],
     model_name: Optional[str] = None,
     model_info: Optional[ModelInfo] = None,
@@ -38,6 +40,113 @@ async def calculate_batch_cost_and_usage(
     batch_models = _get_batch_models_from_file_content(file_content_dictionary, model_name, custom_llm_provider)
 
     return batch_cost, batch_usage, batch_models
+
+
+async def calculate_batch_cost_and_usage_from_file_bytes(
+    file_content: bytes,
+    custom_llm_provider: Literal["openai", "azure", "vertex_ai", "hosted_vllm", "anthropic"],
+    model_name: str | None = None,
+    model_info: ModelInfo | None = None,
+) -> Tuple[float, Usage, List[str]]:
+    """
+    Compute batch cost/usage by streaming JSONL rows instead of materializing the
+    full output file as a list. Avoids multi-GB transient buffers on image-gen batches.
+    """
+    if (
+        custom_llm_provider == "vertex_ai"
+        and model_name
+        and getattr(litellm, "disable_vertex_batch_output_transformation", False)
+    ):
+        return await calculate_batch_cost_and_usage(
+            file_content_dictionary=_get_file_content_as_dictionary(file_content),
+            custom_llm_provider=custom_llm_provider,
+            model_name=model_name,
+            model_info=model_info,
+        )
+
+    return _accumulate_batch_output_metrics_from_file_bytes(
+        file_content=file_content,
+        custom_llm_provider=custom_llm_provider,
+        model_name=model_name,
+        model_info=model_info,
+    )
+
+
+def _accumulate_batch_output_metrics_from_file_bytes(
+    file_content: bytes,
+    custom_llm_provider: Literal["openai", "azure", "vertex_ai", "hosted_vllm", "anthropic"],
+    model_name: Optional[str] = None,
+    model_info: Optional[ModelInfo] = None,
+) -> Tuple[float, Usage, List[str]]:
+    from litellm.cost_calculator import batch_cost_calculator
+
+    total_cost = 0.0
+    total_tokens = 0
+    prompt_tokens = 0
+    completion_tokens = 0
+    cache_read_tokens = 0
+    cache_creation_tokens = 0
+    batch_models: List[str] = []
+    seen_models: set[str] = set()
+
+    for _item in _iter_batch_input_entries(file_content):
+        if not _batch_response_was_successful(_item, custom_llm_provider):
+            continue
+
+        _response_body = _get_response_from_batch_job_output_file(_item, custom_llm_provider)
+
+        resolved_model = model_name
+        if resolved_model is None:
+            resolved_model = _response_body.get("model")
+        if resolved_model and resolved_model not in seen_models:
+            batch_models.append(resolved_model)
+            seen_models.add(resolved_model)
+
+        if model_info is not None or custom_llm_provider in ("anthropic", "bedrock"):
+            usage = _get_batch_job_usage_from_response_body(_response_body, custom_llm_provider)
+            if custom_llm_provider == "bedrock" and model_name:
+                pricing_model = model_name
+            else:
+                pricing_model = _response_body.get("model") or model_name or ""
+            prompt_cost, completion_cost = batch_cost_calculator(
+                usage=usage,
+                model=pricing_model,
+                custom_llm_provider=custom_llm_provider,
+                model_info=model_info,
+            )
+            total_cost += prompt_cost + completion_cost
+        else:
+            total_cost += litellm.completion_cost(
+                completion_response=_response_body,
+                custom_llm_provider=custom_llm_provider,
+                call_type=CallTypes.aretrieve_batch.value,
+            )
+
+        usage = _get_batch_job_usage_from_response_body(_response_body, custom_llm_provider)
+        total_tokens += usage.total_tokens
+        prompt_tokens += usage.prompt_tokens
+        completion_tokens += usage.completion_tokens
+        prompt_details = _parse_prompt_tokens_details(usage)
+        cache_read_tokens += prompt_details["cache_hit_tokens"]
+        cache_creation_tokens += prompt_details["cache_creation_tokens"]
+
+    cache_token_params = {
+        key: tokens
+        for key, tokens in (
+            ("cache_read_input_tokens", cache_read_tokens),
+            ("cache_creation_input_tokens", cache_creation_tokens),
+        )
+        if tokens > 0
+    }
+    batch_usage = Usage(
+        total_tokens=total_tokens,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        **cache_token_params,
+    )
+    if model_name and not batch_models:
+        batch_models = [model_name]
+    return total_cost, batch_usage, batch_models
 
 
 async def _handle_completed_batch(
@@ -77,7 +186,7 @@ async def _handle_completed_batch(
 
 
 def _get_batch_models_from_file_content(
-    file_content_dictionary: List[dict],
+    file_content_dictionary: Iterable[dict],
     model_name: Optional[str] = None,
     custom_llm_provider: str = "openai",
 ) -> List[str]:
@@ -97,7 +206,7 @@ def _get_batch_models_from_file_content(
 
 
 def _batch_cost_calculator(
-    file_content_dictionary: List[dict],
+    file_content_dictionary: Iterable[dict],
     custom_llm_provider: Literal["openai", "azure", "vertex_ai", "hosted_vllm", "anthropic"] = "openai",
     model_name: Optional[str] = None,
     model_info: Optional[ModelInfo] = None,
@@ -110,7 +219,10 @@ def _batch_cost_calculator(
         and model_name
         and getattr(litellm, "disable_vertex_batch_output_transformation", False)
     ):
-        batch_cost, _ = calculate_vertex_ai_batch_cost_and_usage(file_content_dictionary, model_name)
+        vertex_rows = (
+            file_content_dictionary if isinstance(file_content_dictionary, list) else list(file_content_dictionary)
+        )
+        batch_cost, _ = calculate_vertex_ai_batch_cost_and_usage(vertex_rows, model_name)
         verbose_logger.debug("vertex_ai_total_cost=%s", batch_cost)
         return batch_cost
 
@@ -291,7 +403,8 @@ def _get_file_content_as_dictionary(file_content: bytes) -> List[dict]:
         for line in _file_content_str.strip().split("\n"):
             if line:  # Skip empty lines
                 json_objects.append(json.loads(line))
-        verbose_logger.debug("json_objects=%s", json.dumps(json_objects, indent=4))
+        if verbose_logger.isEnabledFor(logging.DEBUG):
+            verbose_logger.debug("json_objects=%s", json.dumps(json_objects, indent=4))
         return json_objects
     except Exception as e:
         raise e
@@ -362,7 +475,7 @@ def _count_entry_tokens(
 
 
 def _get_batch_job_cost_from_file_content(
-    file_content_dictionary: List[dict],
+    file_content_dictionary: Iterable[dict],
     custom_llm_provider: Literal["openai", "azure", "vertex_ai", "hosted_vllm", "anthropic"] = "openai",
     model_name: Optional[str] = None,
     model_info: Optional[ModelInfo] = None,
@@ -374,8 +487,14 @@ def _get_batch_job_cost_from_file_content(
 
     try:
         total_cost: float = 0.0
-        # parse the file content as json
-        verbose_logger.debug("file_content_dictionary=%s", json.dumps(file_content_dictionary, indent=4))
+        if verbose_logger.isEnabledFor(logging.DEBUG):
+            if isinstance(file_content_dictionary, list):
+                verbose_logger.debug(
+                    "file_content_dictionary=%s",
+                    json.dumps(file_content_dictionary, indent=4),
+                )
+            else:
+                verbose_logger.debug("file_content_dictionary=<streaming batch output>")
         for _item in file_content_dictionary:
             if _batch_response_was_successful(_item, custom_llm_provider):
                 _response_body = _get_response_from_batch_job_output_file(_item, custom_llm_provider)
@@ -409,7 +528,7 @@ def _get_batch_job_cost_from_file_content(
 
 
 def _get_batch_job_total_usage_from_file_content(
-    file_content_dictionary: List[dict],
+    file_content_dictionary: Iterable[dict],
     custom_llm_provider: Literal["openai", "azure", "vertex_ai", "hosted_vllm", "anthropic"] = "openai",
     model_name: Optional[str] = None,
 ) -> Usage:
@@ -421,7 +540,10 @@ def _get_batch_job_total_usage_from_file_content(
         and model_name
         and getattr(litellm, "disable_vertex_batch_output_transformation", False)
     ):
-        _, batch_usage = calculate_vertex_ai_batch_cost_and_usage(file_content_dictionary, model_name)
+        vertex_rows = (
+            file_content_dictionary if isinstance(file_content_dictionary, list) else list(file_content_dictionary)
+        )
+        _, batch_usage = calculate_vertex_ai_batch_cost_and_usage(vertex_rows, model_name)
         return batch_usage
 
     # For other providers, use the existing logic
