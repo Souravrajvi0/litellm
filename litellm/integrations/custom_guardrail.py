@@ -946,7 +946,7 @@ class CustomGuardrail(CustomLogger):
         - GuardrailRaisedException (generic guardrail API, tool permission)
         - BlockedPiiEntityError (Presidio PII detection)
         - SensitiveDataRouteException (sensitive-data reroute to on-premise model)
-        - HTTPException with status 400 (content policy violation)
+        - HTTPException with a 4xx status (content policy violation / deliberate reject)
         - ModifyResponseException (passthrough mode violation)
         """
         if isinstance(e, ModifyResponseException):
@@ -960,7 +960,7 @@ class CustomGuardrail(CustomLogger):
             ),
         ):
             return True
-        if HTTPException is not None and isinstance(e, HTTPException) and e.status_code == 400:
+        if HTTPException is not None and isinstance(e, HTTPException) and 400 <= e.status_code < 500:
             return True
         return False
 

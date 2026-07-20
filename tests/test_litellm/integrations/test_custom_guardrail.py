@@ -1575,6 +1575,46 @@ class TestCustomGuardrailSpendLogMatchRedaction:
 class TestGuardrailInterventionClassification:
     """A routing decision is a deliberate guardrail intervention, not a failure."""
 
+    @pytest.mark.parametrize("status_code", [400, 403, 422])
+    def test_http_exception_4xx_is_intervention(self, status_code):
+        from fastapi import HTTPException
+
+        exc = HTTPException(status_code=status_code, detail="blocked by guardrail")
+        assert CustomGuardrail._is_guardrail_intervention(exc) is True
+
+    def test_http_exception_5xx_is_not_intervention(self):
+        from fastapi import HTTPException
+
+        exc = HTTPException(status_code=500, detail="upstream failed")
+        assert CustomGuardrail._is_guardrail_intervention(exc) is False
+
+    @pytest.mark.asyncio
+    async def test_non_400_http_exception_logged_as_intervened(self):
+        from fastapi import HTTPException
+        from litellm.integrations.custom_guardrail import log_guardrail_information
+        from litellm.types.guardrails import GuardrailEventHooks
+
+        class BlockOnTriggerGuardrail(CustomGuardrail):
+            def __init__(self):
+                super().__init__(
+                    guardrail_name="block-on-trigger-word",
+                    event_hook=GuardrailEventHooks.pre_call,
+                )
+
+            @log_guardrail_information
+            async def async_pre_call_hook(self, data, **kwargs):
+                raise HTTPException(status_code=403, detail="Blocked by guardrail")
+
+        guardrail = BlockOnTriggerGuardrail()
+        request_data: dict = {"metadata": {}}
+
+        with pytest.raises(HTTPException) as exc_info:
+            await guardrail.async_pre_call_hook(data=request_data)
+
+        assert exc_info.value.status_code == 403
+        slg = request_data["metadata"]["standard_logging_guardrail_information"][0]
+        assert slg["guardrail_status"] == "guardrail_intervened"
+
     def test_sensitive_data_route_exception_is_intervention(self):
         from litellm.exceptions import SensitiveDataRouteException
 
