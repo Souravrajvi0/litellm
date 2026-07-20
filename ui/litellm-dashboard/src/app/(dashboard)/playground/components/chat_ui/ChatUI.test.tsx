@@ -413,4 +413,135 @@ describe("ChatUI", () => {
       }
     }
   });
+
+  it("keeps restricted virtual-key models when a slower session fetch finishes later", async () => {
+    let resolveSessionModels: (models: { model_group: string; mode: string }[]) => void = () => {};
+    const sessionModelsPromise = new Promise<{ model_group: string; mode: string }[]>((resolve) => {
+      resolveSessionModels = resolve;
+    });
+
+    (fetchModelsModule.fetchAvailableModels as any).mockImplementation((key: string) => {
+      if (key === "sk-restricted") {
+        return Promise.resolve([{ model_group: "Sonnet-4.5", mode: "chat" }]);
+      }
+      return sessionModelsPromise;
+    });
+
+    render(
+      <ChatUI
+        accessToken="session-token"
+        token="1234567890"
+        userRole="user"
+        userID="1234567890"
+        disabledPersonalKeyCreation={false}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Test Key")).toBeInTheDocument();
+    });
+
+    const keySourceLabel = screen.getByText("Virtual Key Source");
+    const keySourceSelect = keySourceLabel.parentElement?.querySelector(".ant-select-selector");
+    expect(keySourceSelect).toBeTruthy();
+    act(() => {
+      fireEvent.mouseDown(keySourceSelect!);
+    });
+    await waitFor(() => {
+      expect(screen.getByText("Virtual Key")).toBeInTheDocument();
+    });
+    act(() => {
+      fireEvent.click(screen.getByText("Virtual Key"));
+    });
+
+    const keyInput = await waitFor(() => screen.getByPlaceholderText("Enter custom Virtual Key"));
+    act(() => {
+      fireEvent.change(keyInput, { target: { value: "sk-restricted" } });
+    });
+
+    await waitFor(() => {
+      expect(fetchModelsModule.fetchAvailableModels).toHaveBeenCalledWith("sk-restricted");
+    });
+
+    const selectModelLabel = screen.getByText("Select Model");
+    const modelSelect = selectModelLabel.closest("div")?.querySelector(".ant-select-selector");
+    expect(modelSelect).toBeTruthy();
+    act(() => {
+      fireEvent.mouseDown(modelSelect!);
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Sonnet-4.5").length).toBeGreaterThan(0);
+    });
+
+    await act(async () => {
+      resolveSessionModels([
+        { model_group: "Model 1", mode: "chat" },
+        { model_group: "Model 2", mode: "chat" },
+        { model_group: "Sonnet-4.5", mode: "chat" },
+      ]);
+    });
+
+    act(() => {
+      fireEvent.mouseDown(modelSelect!);
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Sonnet-4.5").length).toBeGreaterThan(0);
+      expect(screen.queryByText("Model 1")).toBeNull();
+      expect(screen.queryByText("Model 2")).toBeNull();
+    });
+  });
+
+  it("clears the model dropdown when switching to Virtual Key before a key is entered", async () => {
+    render(
+      <ChatUI
+        accessToken="session-token"
+        token="1234567890"
+        userRole="user"
+        userID="1234567890"
+        disabledPersonalKeyCreation={false}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(fetchModelsModule.fetchAvailableModels).toHaveBeenCalledWith("session-token");
+    });
+
+    const selectModelLabel = screen.getByText("Select Model");
+    const modelSelect = selectModelLabel.closest("div")?.querySelector(".ant-select-selector");
+    expect(modelSelect).toBeTruthy();
+    act(() => {
+      fireEvent.mouseDown(modelSelect!);
+    });
+    await waitFor(() => {
+      expect(screen.getAllByText("Model 1").length).toBeGreaterThan(0);
+    });
+
+    const keySourceLabel = screen.getByText("Virtual Key Source");
+    const keySourceSelect = keySourceLabel.parentElement?.querySelector(".ant-select-selector");
+    expect(keySourceSelect).toBeTruthy();
+    act(() => {
+      fireEvent.mouseDown(keySourceSelect!);
+    });
+    await waitFor(() => {
+      expect(screen.getByText("Virtual Key")).toBeInTheDocument();
+    });
+    act(() => {
+      fireEvent.click(screen.getByText("Virtual Key"));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText("Enter custom Virtual Key")).toBeInTheDocument();
+    });
+
+    act(() => {
+      fireEvent.mouseDown(modelSelect!);
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("Model 1")).toBeNull();
+      expect(screen.queryByText("Model 2")).toBeNull();
+      expect(screen.queryByText("Model 3")).toBeNull();
+    });
+  });
 });

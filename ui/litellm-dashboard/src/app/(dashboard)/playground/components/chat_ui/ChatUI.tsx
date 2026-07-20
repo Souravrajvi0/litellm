@@ -390,30 +390,36 @@ const ChatUI: React.FC<ChatUIProps> = ({
   ]);
 
   useEffect(() => {
-    let userApiKey = apiKeySource === "session" ? accessToken : apiKey;
+    let active = true;
+    const userApiKey = apiKeySource === "session" ? accessToken : apiKey;
     if (!userApiKey || !token || !userRole || !userID) {
-      return;
+      if (!simplified) {
+        setModelInfo([]);
+        setSelectedModel(undefined);
+      }
+      return () => {
+        active = false;
+      };
     }
 
-    // Fetch model info and set the default selected model (skip in simplified mode; we use fixedModel)
     const loadModels = async () => {
       try {
-        if (!userApiKey) {
+        const uniqueModels = await fetchAvailableModels(userApiKey);
+        if (!active) {
           return;
         }
-        const uniqueModels = await fetchAvailableModels(userApiKey);
-
         setModelInfo(uniqueModels);
 
-        // check for selection overlap or empty model list
         const hasSelection = uniqueModels.some((m) => m.model_group === selectedModel);
-        if (!uniqueModels.length) {
-          setSelectedModel(undefined);
-        } else if (!hasSelection) {
+        if (!uniqueModels.length || !hasSelection) {
           setSelectedModel(undefined);
         }
       } catch (error) {
         console.error("Error fetching model info:", error);
+        if (active) {
+          setModelInfo([]);
+          setSelectedModel(undefined);
+        }
       }
     };
 
@@ -421,6 +427,9 @@ const ChatUI: React.FC<ChatUIProps> = ({
       loadModels();
     }
     loadMCPServers();
+    return () => {
+      active = false;
+    };
   }, [accessToken, userID, userRole, apiKeySource, apiKey, token, simplified]);
 
   // Load tools when MCP direct mode has a server (or toolset) selected
