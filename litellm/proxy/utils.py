@@ -5178,14 +5178,11 @@ class ProxyUpdateSpend:
     ):
         BATCH_SIZE = 1000  # Preferred size of each batch to write to the database
         MAX_LOGS_PER_INTERVAL = 10000  # Maximum number of logs to flush in a single interval
-        popped_batch = False
+        caller_detached_batch = logs_to_process is not None
         if logs_to_process is None:
-            # Atomically read and remove logs to process (protected by lock)
             async with prisma_client._spend_log_transactions_lock:
                 logs_to_process = prisma_client.spend_log_transactions[:MAX_LOGS_PER_INTERVAL]
-                # Remove the logs we're about to process
                 prisma_client.spend_log_transactions = prisma_client.spend_log_transactions[len(logs_to_process) :]
-            popped_batch = True
         if len(logs_to_process) > 0:
             verbose_proxy_logger.info(
                 "Spend tracking - processing %d spend logs for DB write",
@@ -5208,7 +5205,6 @@ class ProxyUpdateSpend:
                         )
                         del json_data
                         if response.status_code == 200:
-                            # Items already removed from queue at start of function
                             pass
                     else:
                         for j in range(0, len(logs_to_process), BATCH_SIZE):
@@ -5220,10 +5216,8 @@ class ProxyUpdateSpend:
                                 MAX_SPEND_LOG_ISOLATION_ATTEMPTS_PER_BATCH,
                             )
                             verbose_proxy_logger.debug(f"Flushed {len(batch)} logs to the DB.")
-                            # Explicitly clear batch memory
                             del batch, batch_with_dates
 
-                        # Items already removed from queue at start of function
                         async with prisma_client._spend_log_transactions_lock:
                             remaining_count = len(prisma_client.spend_log_transactions)
                         verbose_proxy_logger.debug(
@@ -5244,12 +5238,11 @@ class ProxyUpdateSpend:
                         raise
                     await asyncio.sleep(2**i)
         except Exception as e:
-            # Logs already removed from queue at start - don't put them back
-            # This matches the original behavior where logs are removed even on error
+            async with prisma_client._spend_log_transactions_lock:
+                prisma_client.spend_log_transactions = logs_to_process + prisma_client.spend_log_transactions
             _raise_failed_update_spend_exception(e=e, start_time=start_time, proxy_logging_obj=proxy_logging_obj)
         finally:
-            # Clean up logs_to_process only if we popped it (caller-owned otherwise)
-            if popped_batch:
+            if not caller_detached_batch:
                 del logs_to_process
 
     @staticmethod

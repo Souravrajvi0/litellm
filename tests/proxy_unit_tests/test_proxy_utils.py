@@ -1852,10 +1852,8 @@ async def test_spend_logs_cleanup_after_error():
             proxy_logging_obj=MagicMock(),
         )
 
-    # Verify the first batch was removed from spend_log_transactions
-    assert (
-        mock_client.spend_log_transactions == original_logs[100:]
-    ), "Should remove processed logs even after error"
+    # Verify failed writes restore the batch to the queue for retry
+    assert mock_client.spend_log_transactions == original_logs
 
 
 def test_provider_specific_header():

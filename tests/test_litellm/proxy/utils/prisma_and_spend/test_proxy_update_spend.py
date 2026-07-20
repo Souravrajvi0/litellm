@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -206,7 +206,7 @@ async def test_update_spend_logs_failure_raises_after_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When all retries exhaust the underlying DB error, the helper raises
-    via ``_raise_failed_update_spend_exception``.
+    via ``_raise_failed_update_spend_exception`` and restores the batch.
     """
     import httpx
     import litellm.proxy.utils as utils_mod
@@ -216,6 +216,7 @@ async def test_update_spend_logs_failure_raises_after_retries(
 
     monkeypatch.setattr(utils_mod.asyncio, "sleep", _fake_sleep)
 
+    logs = [make_spend_log_row(request_id="r1")]
     mock_prisma_client.db.litellm_spendlogs.create_many = AsyncMock(
         side_effect=httpx.ReadError("network blip")
     )
@@ -227,8 +228,81 @@ async def test_update_spend_logs_failure_raises_after_retries(
             prisma_client=mock_prisma_client,
             db_writer_client=None,
             proxy_logging_obj=proxy_logging,
-            logs_to_process=[make_spend_log_row(request_id="r1")],
+            logs_to_process=logs,
         )
+    assert mock_prisma_client.spend_log_transactions == logs
+
+
+@pytest.mark.asyncio
+async def test_update_spend_logs_failure_restores_queue_when_popped_from_source(
+    mock_prisma_client: Any,
+    make_spend_log_row: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for #33873: a failed DB write must not drop popped spend-log rows."""
+    import litellm.proxy.utils as utils_mod
+
+    mock_prisma_client.spend_log_transactions = [
+        make_spend_log_row(request_id="r1"),
+        make_spend_log_row(request_id="r2"),
+    ]
+    mock_prisma_client.db.litellm_spendlogs.create_many = AsyncMock(
+        side_effect=RuntimeError("database unavailable")
+    )
+    proxy_logging = MagicMock()
+    proxy_logging.failure_handler = AsyncMock()
+
+    with patch.object(
+        utils_mod,
+        "_create_spend_logs_with_poison_isolation",
+        AsyncMock(side_effect=RuntimeError("database unavailable")),
+    ):
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await ProxyUpdateSpend.update_spend_logs(
+                n_retry_times=0,
+                prisma_client=mock_prisma_client,
+                db_writer_client=None,
+                proxy_logging_obj=proxy_logging,
+            )
+
+    assert [row["request_id"] for row in mock_prisma_client.spend_log_transactions] == [
+        "r1",
+        "r2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_update_spend_logs_job_restores_queue_on_write_failure(
+    mock_prisma_client: Any,
+    make_spend_log_row: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for #33873: update_spend_logs_job must not lose detached batches."""
+    import litellm.proxy.utils as utils_mod
+
+    mock_prisma_client.spend_log_transactions = [
+        make_spend_log_row(request_id="r1"),
+        make_spend_log_row(request_id="r2"),
+    ]
+    proxy_logging = MagicMock()
+    proxy_logging.failure_handler = AsyncMock()
+
+    with patch.object(
+        utils_mod,
+        "_create_spend_logs_with_poison_isolation",
+        AsyncMock(side_effect=RuntimeError("database unavailable")),
+    ):
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await utils_mod.update_spend_logs_job(
+                prisma_client=mock_prisma_client,
+                db_writer_client=None,
+                proxy_logging_obj=proxy_logging,
+            )
+
+    assert [row["request_id"] for row in mock_prisma_client.spend_log_transactions] == [
+        "r1",
+        "r2",
+    ]
 
 
 def _data_error(message: str) -> Any:
@@ -297,6 +371,10 @@ async def test_update_spend_logs_reraises_connection_masquerade_dataerror(
                 make_spend_log_row(request_id="b"),
             ],
         )
+    assert [row["request_id"] for row in mock_prisma_client.spend_log_transactions] == [
+        "a",
+        "b",
+    ]
 
 
 @pytest.mark.asyncio
