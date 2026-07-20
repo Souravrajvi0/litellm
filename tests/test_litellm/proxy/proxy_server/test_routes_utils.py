@@ -8,9 +8,12 @@ Pins (PR2):
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+import asyncio
+import time
 
+import httpx
 import pytest
+from httpx import ASGITransport
 
 import litellm
 from litellm.proxy import proxy_server
@@ -158,3 +161,40 @@ def test_transform_request_unsafe_body(client, auth_as, monkeypatch):
         response = client.post("/utils/transform_request", json=payload)
     assert response.status_code == 400
     assert "unsafe" in response.text or "error" in response.text
+
+
+@pytest.mark.asyncio
+async def test_transform_request_does_not_block_event_loop(app, auth_as, monkeypatch):
+    """
+    Regression for #33952: slow provider I/O inside return_raw_request must not
+    block unrelated async routes such as /health/liveliness
+    """
+    monkeypatch.setattr(proxy_server, "llm_router", None)
+    monkeypatch.setattr(proxy_server, "is_request_body_safe", lambda **kwargs: True)
+
+    def _slow_return_raw_request(endpoint, kwargs):
+        time.sleep(0.3)
+        return {
+            "raw_request_api_base": "https://api.openai.com/v1/chat/completions",
+            "raw_request_body": kwargs,
+            "raw_request_headers": {"Authorization": "Bearer redacted"},
+        }
+
+    monkeypatch.setattr("litellm.utils.return_raw_request", _slow_return_raw_request)
+
+    payload = {"call_type": "completion", "request_body": {"model": "gpt-4"}}
+    with auth_as():
+        transport = ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+            transform_task = asyncio.create_task(
+                async_client.post("/utils/transform_request", json=payload)
+            )
+            await asyncio.sleep(0.02)
+            started_at = time.monotonic()
+            health_response = await async_client.get("/health/liveliness")
+            health_elapsed = time.monotonic() - started_at
+            transform_response = await transform_task
+
+    assert health_response.status_code == 200
+    assert health_elapsed < 0.15
+    assert transform_response.status_code == 200
