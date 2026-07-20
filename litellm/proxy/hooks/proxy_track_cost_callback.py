@@ -174,6 +174,7 @@ class _ProxyDBLogger(CustomLogger):
             start_time=actual_start_time,
             end_time=datetime.now(),
             org_id=user_api_key_dict.org_id,
+            project_id=user_api_key_dict.project_id,
         )
 
     @log_db_metrics
@@ -208,6 +209,7 @@ class _ProxyDBLogger(CustomLogger):
             user_id = cast(Optional[str], metadata.get("user_api_key_user_id", None))
             team_id = cast(Optional[str], metadata.get("user_api_key_team_id", None))
             org_id = cast(Optional[str], metadata.get("user_api_key_org_id", None))
+            project_id = metadata.get("user_api_key_project_id", None)
             key_alias = cast(Optional[str], metadata.get("user_api_key_alias", None))
             end_user_max_budget = metadata.get("user_api_end_user_max_budget", None)
             sl_object: Optional[StandardLoggingPayload] = kwargs.get("standard_logging_object", None)
@@ -245,6 +247,7 @@ class _ProxyDBLogger(CustomLogger):
                         end_user_id=end_user_id,
                         team_id=team_id,
                         org_id=org_id,
+                        project_id=project_id,
                         kwargs=kwargs,
                         completion_response=completion_response,
                         start_time=start_time,
@@ -265,6 +268,7 @@ class _ProxyDBLogger(CustomLogger):
                             team_id=team_id,
                             parent_otel_span=parent_otel_span,
                             tags=tags,
+                            project_id=project_id,
                         )
                     )
 
@@ -488,6 +492,7 @@ async def _update_database_and_spend_counters(
     response_cost: float,
     budget_reservation: Optional[dict],
     request_tags: Optional[List[str]] = None,
+    project_id: str | None = None,
 ) -> None:
     try:
         await proxy_logging_obj.db_spend_update_writer.update_database(
@@ -501,6 +506,7 @@ async def _update_database_and_spend_counters(
             start_time=start_time,
             end_time=end_time,
             org_id=org_id,
+            project_id=project_id,
         )
     except Exception:
         if budget_reservation is not None:
@@ -526,6 +532,7 @@ async def _update_database_and_spend_counters(
             budget_reservation=budget_reservation,
             end_user_id=end_user_id,
             tags=request_tags,
+            project_id=project_id,
         )
     except Exception:
         if budget_reservation is not None:

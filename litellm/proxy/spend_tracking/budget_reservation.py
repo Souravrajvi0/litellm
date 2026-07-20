@@ -13,6 +13,7 @@ from litellm.litellm_core_utils.duration_parser import duration_in_seconds
 from litellm.litellm_core_utils.llm_cost_calc.tiered_pricing import select_tier_for_input, tier_rate
 from litellm.proxy._types import (
     Litellm_EntityType,
+    LiteLLM_ProjectTableCachedObj,
     LiteLLM_TeamMembership,
     LiteLLM_TeamTable,
     LiteLLM_UserTable,
@@ -45,6 +46,7 @@ _COUNTER_ENTITY_TYPES: Mapping[str, str] = {
     "EndUser": Litellm_EntityType.END_USER.value,
     "Tag": Litellm_EntityType.TAG.value,
     "Organization": Litellm_EntityType.ORGANIZATION.value,
+    "Project": Litellm_EntityType.PROJECT.value,
 }
 
 
@@ -414,6 +416,13 @@ async def _get_budget_counters(
     if org_counter is not None:
         counters.append(org_counter)
 
+    project_counter = await _get_project_budget_counter(
+        valid_token=valid_token,
+        user_api_key_cache=user_api_key_cache,
+    )
+    if project_counter is not None:
+        counters.append(project_counter)
+
     return counters
 
 
@@ -578,6 +587,40 @@ async def _get_org_budget_counter(
         fallback_spend=org_spend,
         entity_type="Organization",
         entity_id=org_id,
+    )
+
+
+async def _get_project_budget_counter(
+    valid_token: UserAPIKeyAuth,
+    user_api_key_cache: DualCache,
+) -> _BudgetCounter | None:
+    project_id = valid_token.project_id
+    if project_id is None:
+        return None
+
+    project_table = await user_api_key_cache.async_get_cache(
+        key=f"project_id:{project_id}",
+        model_type=LiteLLM_ProjectTableCachedObj,
+    )
+    if project_table is None:
+        return None
+
+    project_budget_table = _get_value(project_table, "litellm_budget_table")
+    if project_budget_table is None:
+        return None
+
+    project_max_budget = _to_float(_get_value(project_budget_table, "max_budget"))
+    if project_max_budget is None or project_max_budget <= 0:
+        return None
+
+    project_spend = _to_float(_get_value(project_table, "spend")) or 0.0
+    return _BudgetCounter(
+        counter_key=f"spend:project:{project_id}",
+        source_cache_key=f"project_id:{project_id}",
+        max_budget=project_max_budget,
+        fallback_spend=project_spend,
+        entity_type="Project",
+        entity_id=project_id,
     )
 
 

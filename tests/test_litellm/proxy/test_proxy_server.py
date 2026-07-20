@@ -7006,6 +7006,9 @@ async def test_reseed_spend_from_db_user_and_org_prefixes():
     fake_prisma.db.litellm_organizationtable.find_unique = AsyncMock(
         return_value=org_row
     )
+    project_row = MagicMock()
+    project_row.spend = 42.0
+    fake_prisma.db.litellm_projecttable.find_unique = AsyncMock(return_value=project_row)
 
     assert await SpendCounterReseed.from_db(fake_prisma, "spend:user:alice") == 17.0
     fake_prisma.db.litellm_usertable.find_unique.assert_awaited_once_with(
@@ -7027,6 +7030,11 @@ async def test_reseed_spend_from_db_user_and_org_prefixes():
     assert await SpendCounterReseed.from_db(fake_prisma, "spend:org:acme") == 305.0
     fake_prisma.db.litellm_organizationtable.find_unique.assert_awaited_once_with(
         where={"organization_id": "acme"}
+    )
+
+    assert await SpendCounterReseed.from_db(fake_prisma, "spend:project:proj-1") == 42.0
+    fake_prisma.db.litellm_projecttable.find_unique.assert_awaited_once_with(
+        where={"project_id": "proj-1"}
     )
 
 

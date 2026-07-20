@@ -4516,6 +4516,7 @@ class DBSpendUpdateTransactions(TypedDict):
     org_list_transactions: Optional[Dict[str, float]]
     tag_list_transactions: Optional[Dict[str, float]]
     agent_list_transactions: Optional[Dict[str, float]]
+    project_list_transactions: dict[str, float] | None
 
 
 class SpendUpdateQueueItem(TypedDict, total=False):

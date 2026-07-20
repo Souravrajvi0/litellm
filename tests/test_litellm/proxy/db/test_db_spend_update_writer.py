@@ -678,6 +678,7 @@ async def test_commit_spend_updates_to_db_increments_agent_spend():
         "org_list_transactions": {},
         "tag_list_transactions": {},
         "agent_list_transactions": {agent_id: response_cost},
+        "project_list_transactions": {},
     }
 
     with patch("litellm.proxy.utils._raise_failed_update_spend_exception"):
@@ -750,6 +751,7 @@ async def test_commit_spend_updates_to_db_increments_team_member_spend_and_total
         "org_list_transactions": {},
         "tag_list_transactions": {},
         "agent_list_transactions": {},
+        "project_list_transactions": {},
     }
 
     with patch("litellm.proxy.utils._raise_failed_update_spend_exception"):
@@ -1320,6 +1322,7 @@ async def test_commit_key_spend_updates_includes_last_active():
         "org_list_transactions": {},
         "tag_list_transactions": {},
         "agent_list_transactions": {},
+        "project_list_transactions": {},
     }
 
     before_call = datetime.now(timezone.utc)
@@ -1404,6 +1407,7 @@ async def test_batch_database_updates_isolation_on_failure():
     db_writer._update_user_db = AsyncMock()
     db_writer._update_team_db = AsyncMock()
     db_writer._update_org_db = AsyncMock()
+    db_writer._update_project_db = AsyncMock()
     db_writer._update_tag_db = AsyncMock()
     db_writer._update_agent_db = AsyncMock()
     db_writer.add_spend_log_transaction_to_daily_user_transaction = AsyncMock()
@@ -1430,6 +1434,7 @@ async def test_batch_database_updates_isolation_on_failure():
     db_writer._update_key_db.assert_awaited_once()
     db_writer._update_team_db.assert_awaited_once()
     db_writer._update_org_db.assert_awaited_once()
+    db_writer._update_project_db.assert_awaited_once()
     db_writer._update_tag_db.assert_awaited_once()
     db_writer._update_agent_db.assert_awaited_once()
     db_writer.add_spend_log_transaction_to_daily_user_transaction.assert_awaited_once()
@@ -1465,6 +1470,7 @@ async def test_daily_agent_receives_deepcopied_payload():
     db_writer._update_key_db = AsyncMock()
     db_writer._update_team_db = AsyncMock()
     db_writer._update_org_db = AsyncMock()
+    db_writer._update_project_db = AsyncMock()
     db_writer._update_tag_db = AsyncMock()
     db_writer._update_agent_db = AsyncMock()
     db_writer.add_spend_log_transaction_to_daily_user_transaction = AsyncMock()
@@ -1644,6 +1650,15 @@ async def test_commit_spend_updates_uses_pipeline():
             ["agent_a", "agent_b", "agent_c"],
             id="agent",
         ),
+        pytest.param(
+            "project_list_transactions",
+            {"project_c": 0.1, "project_a": 0.2, "project_b": 0.3},
+            "litellm_projecttable",
+            "update_many",
+            "project_id",
+            ["project_a", "project_b", "project_c"],
+            id="project",
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -1695,6 +1710,7 @@ async def test_commit_spend_updates_iterates_in_sorted_order(
         "org_list_transactions": {},
         "tag_list_transactions": {},
         "agent_list_transactions": {},
+        "project_list_transactions": {},
     }
     buckets[bucket_name] = input_dict
 
@@ -1741,6 +1757,7 @@ async def test_update_database_does_not_deepcopy_on_request_path():
     db_writer._update_key_db = AsyncMock()
     db_writer._update_team_db = AsyncMock()
     db_writer._update_org_db = AsyncMock()
+    db_writer._update_project_db = AsyncMock()
     db_writer._update_tag_db = AsyncMock()
     db_writer._update_agent_db = AsyncMock()
     db_writer.add_spend_log_transaction_to_daily_user_transaction = AsyncMock(
@@ -2002,3 +2019,24 @@ async def test_daily_transaction_compression_saved_tokens_zero_when_absent():
     assert transaction["compression_saved_tokens"] == 0
     assert transaction["compression_savings_spend"] == 0
     assert transaction["prompt_caching_savings_spend"] == 0
+
+
+@pytest.mark.asyncio
+async def test_update_project_db_enqueues_project_spend():
+    """Regression for #33871: billable requests with project_id must enqueue project spend."""
+    from litellm.proxy._types import Litellm_EntityType
+
+    db_writer = DBSpendUpdateWriter()
+    db_writer.spend_update_queue.add_update = AsyncMock()
+
+    await db_writer._update_project_db(
+        response_cost=1.25,
+        project_id="project-1",
+        prisma_client=MagicMock(),
+    )
+
+    db_writer.spend_update_queue.add_update.assert_awaited_once()
+    queued = db_writer.spend_update_queue.add_update.call_args.kwargs["update"]
+    assert queued["entity_type"] == Litellm_EntityType.PROJECT
+    assert queued["entity_id"] == "project-1"
+    assert queued["response_cost"] == 1.25

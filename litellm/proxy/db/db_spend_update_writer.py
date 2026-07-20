@@ -135,6 +135,7 @@ class DBSpendUpdateWriter:
         start_time: Optional[datetime],
         end_time: Optional[datetime],
         response_cost: Optional[float],
+        project_id: str | None = None,
     ):
         from litellm.proxy.proxy_server import (
             disable_spend_logs,
@@ -195,6 +196,7 @@ class DBSpendUpdateWriter:
                     hashed_token=hashed_token,
                     team_id=team_id,
                     org_id=org_id,
+                    project_id=project_id,
                     end_user_id=end_user_id,
                     prisma_client=prisma_client,
                     litellm_proxy_budget_name=litellm_proxy_budget_name,
@@ -325,6 +327,7 @@ class DBSpendUpdateWriter:
         hashed_token: Optional[str],
         team_id: Optional[str],
         org_id: Optional[str],
+        project_id: str | None = None,
         end_user_id: Optional[str],
         prisma_client: Optional[PrismaClient],
         litellm_proxy_budget_name: Optional[str],
@@ -388,6 +391,18 @@ class DBSpendUpdateWriter:
         except Exception:
             verbose_proxy_logger.debug(
                 "_batch_database_updates: _update_org_db failed: %s",
+                traceback.format_exc(),
+            )
+
+        try:
+            await self._update_project_db(
+                response_cost=response_cost,
+                project_id=project_id,
+                prisma_client=prisma_client,
+            )
+        except Exception:
+            verbose_proxy_logger.debug(
+                "_batch_database_updates: _update_project_db failed: %s",
                 traceback.format_exc(),
             )
 
@@ -635,6 +650,26 @@ class DBSpendUpdateWriter:
             )
             raise e
 
+    async def _update_project_db(
+        self,
+        response_cost: float | None,
+        project_id: str | None,
+        prisma_client: PrismaClient | None,
+    ):
+        if project_id is None or prisma_client is None:
+            verbose_proxy_logger.debug(
+                "track_cost_callback: project_id is None or prisma_client is None. Not tracking spend for project"
+            )
+            return
+
+        await self.spend_update_queue.add_update(
+            update=SpendUpdateQueueItem(
+                entity_type=Litellm_EntityType.PROJECT,
+                entity_id=project_id,
+                response_cost=response_cost,
+            )
+        )
+
     async def _update_agent_db(
         self,
         response_cost: Optional[float],
@@ -814,7 +849,7 @@ class DBSpendUpdateWriter:
                 if db_spend_update_transactions is not None:
                     verbose_proxy_logger.info(
                         "Spend tracking - committing spend updates from Redis to DB: "
-                        "keys=%d, users=%d, teams=%d, orgs=%d, end_users=%d, team_members=%d, tags=%d, agents=%d",
+                        "keys=%d, users=%d, teams=%d, orgs=%d, end_users=%d, team_members=%d, tags=%d, agents=%d, projects=%d",
                         len(db_spend_update_transactions.get("key_list_transactions") or {}),
                         len(db_spend_update_transactions.get("user_list_transactions") or {}),
                         len(db_spend_update_transactions.get("team_list_transactions") or {}),
@@ -823,6 +858,7 @@ class DBSpendUpdateWriter:
                         len(db_spend_update_transactions.get("team_member_list_transactions") or {}),
                         len(db_spend_update_transactions.get("tag_list_transactions") or {}),
                         len(db_spend_update_transactions.get("agent_list_transactions") or {}),
+                        len(db_spend_update_transactions.get("project_list_transactions") or {}),
                     )
                     await self._commit_spend_updates_to_db(
                         prisma_client=prisma_client,
@@ -1301,6 +1337,18 @@ class DBSpendUpdateWriter:
             transactions=agent_list_transactions,
             table_accessor="litellm_agentstable",
             where_field="agent_id",
+            n_retry_times=n_retry_times,
+            prisma_client=prisma_client,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+
+        ### UPDATE PROJECT TABLE ###
+        project_list_transactions = db_spend_update_transactions["project_list_transactions"]
+        await DBSpendUpdateWriter._update_entity_spend_in_db(
+            entity_name="Project",
+            transactions=project_list_transactions,
+            table_accessor="litellm_projecttable",
+            where_field="project_id",
             n_retry_times=n_retry_times,
             prisma_client=prisma_client,
             proxy_logging_obj=proxy_logging_obj,

@@ -91,6 +91,7 @@ from litellm.proxy._types import (
     LiteLLM_TagTable,
     LiteLLM_TeamTable,
     LiteLLM_TeamTableCachedObj,
+    LiteLLM_ProjectTableCachedObj,
     LiteLLM_UserTable,
     LitellmUserRoles,
     PassThroughGenericEndpoint,
@@ -2332,6 +2333,7 @@ async def increment_spend_counters(
     budget_reservation: Optional[dict] = None,
     end_user_id: Optional[str] = None,
     tags: Optional[List[str]] = None,
+    project_id: str | None = None,
 ):
     """
     Atomically increment spend counters for budget enforcement.
@@ -2446,6 +2448,15 @@ async def increment_spend_counters(
             increment=cost,
         )
 
+    async def _project_scope(scope_project_id: str) -> None:
+        project_counter_key = f"spend:project:{scope_project_id}"
+        if project_counter_key not in reserved_counter_keys:
+            await _init_and_increment_spend_counter(
+                counter_key=project_counter_key,
+                source_cache_key=f"project_id:{scope_project_id}",
+                increment=cost,
+            )
+
     scope_coros = tuple(
         coro
         for coro in (
@@ -2468,6 +2479,7 @@ async def increment_spend_counters(
             )
             if org_id is not None
             else None,
+            _project_scope(project_id) if project_id is not None else None,
         )
         if coro is not None
     )
@@ -2763,6 +2775,7 @@ async def update_cache(
     response_cost: Optional[float],
     parent_otel_span: Optional[Span],  # type: ignore
     tags: Optional[List[str]] = None,
+    project_id: str | None = None,
 ):
     """
     Use this to update the cache with new user spend.
@@ -2963,6 +2976,46 @@ async def update_cache(
                 traceback.format_exc(),
             )
 
+    ### UPDATE PROJECT SPEND ###
+    async def _update_project_cache():
+        if project_id is None or response_cost is None:
+            return
+
+        _id = "project_id:{}".format(project_id)
+        try:
+            cached_project = await user_api_key_cache.async_get_cache(key=_id)
+            if cached_project is None:
+                return
+            existing_spend_obj: LiteLLM_ProjectTableCachedObj | None = CacheCodec.deserialize(
+                cached_project, LiteLLM_ProjectTableCachedObj
+            )
+            if existing_spend_obj is None:
+                return
+            verbose_proxy_logger.debug(
+                f"_update_project_cache: existing spend: {existing_spend_obj}; response_cost: {response_cost}"
+            )
+
+            existing_spend: float = existing_spend_obj.spend or 0.0
+            new_spend = existing_spend + response_cost
+
+            existing_spend_obj.spend = new_spend
+            values_to_update_in_cache.append(
+                (
+                    _id,
+                    CacheCodec.serialize(existing_spend_obj, model_type=LiteLLM_ProjectTableCachedObj),
+                )
+            )
+        except Exception as e:  # noqa: BLE001  # cache spend update must not break the cost callback
+            verbose_proxy_logger.warning(
+                "Spend tracking - failed to update project spend in cache. "
+                "Budget enforcement may use stale spend values. "
+                "project_id=%s, response_cost=%s - %s\n%s",
+                project_id,
+                response_cost,
+                str(e),
+                traceback.format_exc(),
+            )
+
     ### UPDATE TAG SPEND ###
     async def _update_tag_cache():
         """
@@ -3024,6 +3077,9 @@ async def update_cache(
 
     if team_id is not None:
         await _update_team_cache()
+
+    if project_id is not None:
+        await _update_project_cache()
 
     if tags is not None:
         await _update_tag_cache()

@@ -347,6 +347,10 @@ class RedisUpdateBuffer:
                     Litellm_EntityType.AGENT,
                     db_spend_update_transactions.get("agent_list_transactions"),
                 ),
+                (
+                    Litellm_EntityType.PROJECT,
+                    db_spend_update_transactions.get("project_list_transactions"),
+                ),
             ]
             for entity_type, entities in entity_entries:
                 if not entities:
@@ -719,6 +723,7 @@ class RedisUpdateBuffer:
             org_list_transactions={},
             tag_list_transactions={},
             agent_list_transactions={},
+            project_list_transactions={},
         )
 
         # Define the transaction fields to process
@@ -731,6 +736,7 @@ class RedisUpdateBuffer:
             "org_list_transactions",
             "tag_list_transactions",
             "agent_list_transactions",
+            "project_list_transactions",
         ]
 
         # Loop through each transaction and combine the values

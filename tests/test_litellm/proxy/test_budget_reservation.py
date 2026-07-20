@@ -10,6 +10,7 @@ from litellm.proxy._types import (
     LiteLLM_BudgetTable,
     LiteLLM_EndUserTable,
     LiteLLM_OrganizationTable,
+    LiteLLM_ProjectTableCachedObj,
     LiteLLM_TagTable,
     LiteLLM_TeamMembership,
     LiteLLM_TeamTable,
@@ -18,6 +19,7 @@ from litellm.proxy._types import (
 )
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.spend_tracking.budget_reservation import (
+    _get_budget_counters,
     estimate_request_max_cost,
     get_budget_window_start,
     invalidate_budget_reservation_counters,
@@ -2484,3 +2486,42 @@ async def test_streaming_slow_path_processes_and_yields_chunk(spend_counter_stat
 
     assert received == [{"content": "hi"}]
     streaming_logging_obj.async_post_call_streaming_hook.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_budget_counters_includes_project_with_max_budget(spend_counter_state):
+    """Regression for #33871: project hard budgets must reserve spend counters."""
+    _, key_cache = spend_counter_state
+    project_id = "project-budget-1"
+    await key_cache.async_set_cache(
+        key=f"project_id:{project_id}",
+        value=LiteLLM_ProjectTableCachedObj(
+            project_id=project_id,
+            team_id="team-1",
+            spend=1.0,
+            models=[],
+            created_by="test",
+            updated_by="test",
+            litellm_budget_table=LiteLLM_BudgetTable(max_budget=5.0),
+        ).model_dump(),
+    )
+
+    counters = await _get_budget_counters(
+        request_body={"model": "gpt-4"},
+        valid_token=UserAPIKeyAuth(
+            api_key="hashed-key",
+            token="hashed-key",
+            project_id=project_id,
+        ),
+        team_object=None,
+        user_object=None,
+        prisma_client=MagicMock(),
+        user_api_key_cache=key_cache,
+        proxy_logging_obj=MagicMock(spec=ProxyLogging),
+    )
+
+    project_counters = [c for c in counters if c.entity_type == "Project"]
+    assert len(project_counters) == 1
+    assert project_counters[0].counter_key == f"spend:project:{project_id}"
+    assert project_counters[0].fallback_spend == 1.0
+    assert project_counters[0].max_budget == 5.0

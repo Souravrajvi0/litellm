@@ -225,6 +225,21 @@ async def test_aggregate_queue_updates_accuracy(spend_queue):
     assert aggregated["team_list_transactions"]["team1"] == 5.0
 
 
+def test_project_spend_update_aggregates_to_project_list_transactions(spend_queue):
+    """Regression for #33871: PROJECT entity type must update project_list_transactions."""
+    transactions = spend_queue.get_aggregated_db_spend_update_transactions(
+        [
+            SpendUpdateQueueItem(
+                entity_type=Litellm_EntityType.PROJECT,
+                entity_id="project-1",
+                response_cost=1.25,
+            )
+        ]
+    )
+    assert transactions["project_list_transactions"] == {"project-1": 1.25}
+    assert "project_list_transactions" in transactions
+
+
 def test_get_aggregated_spend_update_queue_item_does_not_mutate_original_updates(
     spend_queue,
 ):
