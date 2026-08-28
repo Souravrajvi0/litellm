@@ -57,6 +57,7 @@ from litellm.proxy.management_endpoints.key_management_endpoints import (
     reset_key_spend_fn,
     validate_key_list_check,
     validate_key_team_change,
+    _validate_key_models_against_team,
 )
 from litellm.proxy.proxy_server import app
 
@@ -3048,6 +3049,137 @@ async def test_validate_key_team_change_skips_all_team_models_sentinel():
             # can_team_access_model should NOT have been called since
             # "all-team-models" is a sentinel that should be skipped
             mock_can_access.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_validate_key_models_against_team_rejects_disallowed_model():
+    """Regression for #38629: key models must be validated against the team catalog."""
+    from litellm.proxy._types import ProxyErrorTypes
+
+    mock_team = MagicMock()
+    mock_team.team_id = "team-b"
+    mock_team.models = ["claude-3-5-haiku", "llama-3.1-8b"]
+
+    with patch(
+        "litellm.proxy.management_endpoints.key_management_endpoints.can_team_access_model",
+        new_callable=AsyncMock,
+        side_effect=ProxyException(
+            message="team not allowed to access model",
+            type=ProxyErrorTypes.team_model_access_denied,
+            param="model",
+            code=403,
+        ),
+    ) as mock_can_access:
+        with pytest.raises(ProxyException) as exc_info:
+            await _validate_key_models_against_team(
+                models=["gpt-4o"],
+                team_object=mock_team,
+                llm_router=MagicMock(),
+            )
+
+        assert exc_info.value.type == ProxyErrorTypes.team_model_access_denied
+        mock_can_access.assert_awaited_once_with(
+            model="gpt-4o",
+            team_object=mock_team,
+            llm_router=mock_can_access.await_args.kwargs["llm_router"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_validate_key_team_change_uses_models_override():
+    """
+    Regression for #38629: when team_id and models change together, validate the
+    requested models rather than the key's pre-update model list.
+    """
+    mock_key = MagicMock()
+    mock_key.user_id = "test-user-123"
+    mock_key.models = ["gpt-4", "claude-opus", "forbidden-model"]
+    mock_key.tpm_limit = None
+    mock_key.rpm_limit = None
+
+    mock_team = MagicMock()
+    mock_team.team_id = "team-a"
+    mock_team.members_with_roles = []
+    mock_team.tpm_limit = None
+    mock_team.rpm_limit = None
+
+    mock_change_initiator = MagicMock()
+    mock_change_initiator.user_id = "test-user-123"
+    mock_change_initiator.user_role = LitellmUserRoles.PROXY_ADMIN.value
+
+    with patch(
+        "litellm.proxy.management_endpoints.key_management_endpoints._validate_key_models_against_team",
+        new_callable=AsyncMock,
+    ) as mock_validate_models:
+        with patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints._get_user_in_team"
+        ) as mock_get_user:
+            mock_get_user.return_value = MagicMock()
+
+            await validate_key_team_change(
+                key=mock_key,
+                team=mock_team,
+                change_initiated_by=mock_change_initiator,
+                llm_router=MagicMock(),
+                models=["gpt-4o-mini"],
+            )
+
+            mock_validate_models.assert_awaited_once_with(
+                models=["gpt-4o-mini"],
+                team_object=mock_team,
+                llm_router=mock_validate_models.await_args.kwargs["llm_router"],
+            )
+
+
+@pytest.mark.asyncio
+async def test_generate_key_rejects_model_outside_team_catalog():
+    """Regression for #38629: /key/generate must reject models the team cannot access."""
+    from litellm.proxy._types import ProxyErrorTypes
+
+    data = GenerateKeyRequest(
+        key_alias="probe",
+        team_id="team-b",
+        models=["gpt-4o"],
+        duration="5m",
+    )
+    user_api_key_dict = UserAPIKeyAuth(
+        user_id="admin-user",
+        user_role=LitellmUserRoles.PROXY_ADMIN,
+    )
+    mock_team = MagicMock()
+    mock_team.team_id = "team-b"
+    mock_team.models = ["claude-3-5-haiku", "llama-3.1-8b"]
+    mock_prisma_client = AsyncMock()
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", mock_prisma_client),
+        patch("litellm.proxy.proxy_server.user_api_key_cache", MagicMock()),
+        patch("litellm.proxy.proxy_server.user_custom_key_generate", None),
+        patch("litellm.proxy.proxy_server.llm_router", MagicMock()),
+        patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints.get_team_object",
+            AsyncMock(return_value=mock_team),
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.key_management_endpoints._check_team_key_limits_and_models",
+            AsyncMock(
+                side_effect=ProxyException(
+                    message="team not allowed to access model",
+                    type=ProxyErrorTypes.team_model_access_denied,
+                    param="model",
+                    code=403,
+                )
+            ),
+        ),
+    ):
+        with pytest.raises(ProxyException) as exc_info:
+            await generate_key_fn(
+                data=data,
+                user_api_key_dict=user_api_key_dict,
+                litellm_changed_by=None,
+            )
+
+        assert exc_info.value.type == ProxyErrorTypes.team_model_access_denied
 
 
 def test_key_rotation_fields_helper():
