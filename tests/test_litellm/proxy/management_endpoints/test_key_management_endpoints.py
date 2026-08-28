@@ -3161,17 +3161,14 @@ async def test_generate_key_rejects_model_outside_team_catalog():
             AsyncMock(return_value=mock_team),
         ),
         patch(
-            "litellm.proxy.management_endpoints.key_management_endpoints._check_team_key_limits",
-            AsyncMock(),
-        ),
-        patch(
-            "litellm.proxy.management_endpoints.key_management_endpoints.can_team_access_model",
-            new_callable=AsyncMock,
-            side_effect=ProxyException(
-                message="team not allowed to access model",
-                type=ProxyErrorTypes.team_model_access_denied,
-                param="model",
-                code=403,
+            "litellm.proxy.management_endpoints.key_management_endpoints._check_team_key_limits_and_models",
+            AsyncMock(
+                side_effect=ProxyException(
+                    message="team not allowed to access model",
+                    type=ProxyErrorTypes.team_model_access_denied,
+                    param="model",
+                    code=403,
+                )
             ),
         ),
     ):

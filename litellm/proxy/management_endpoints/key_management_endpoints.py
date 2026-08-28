@@ -863,6 +863,14 @@ async def _common_key_generation_helper(
         prisma_client,
     )
 
+    if team_table is not None and prisma_client is not None:
+        await _check_team_key_limits_and_models(
+            team_table=team_table,
+            data=data,
+            prisma_client=prisma_client,
+            llm_router=llm_router,
+        )
+
     common_key_access_checks(
         user_api_key_dict=user_api_key_dict,
         data=data,
@@ -1434,6 +1442,31 @@ async def _validate_key_models_against_team(
         )
 
 
+async def _check_team_key_limits_and_models(
+    team_table: LiteLLM_TeamTableCachedObj,
+    data: GenerateKeyRequest | UpdateKeyRequest,
+    prisma_client: PrismaClient,
+    llm_router: Router | None = None,
+) -> None:
+    """Validate team throughput limits and, when models are in scope, team model access."""
+    await _check_team_key_limits(
+        team_table=team_table,
+        data=data,
+        prisma_client=prisma_client,
+    )
+    if isinstance(data, UpdateKeyRequest) and "models" not in data.model_fields_set:
+        return
+    if llm_router is None:
+        from litellm.proxy.proxy_server import llm_router as llm_router_from_proxy
+
+        llm_router = llm_router_from_proxy
+    await _validate_key_models_against_team(
+        models=data.models,
+        team_object=team_table,
+        llm_router=llm_router,
+    )
+
+
 async def _check_project_key_limits(
     project_id: str,
     data: GenerateKeyRequest | UpdateKeyRequest,
@@ -1804,20 +1837,6 @@ async def generate_key_fn(
             route=KeyManagementRoutes.KEY_GENERATE,
         )
 
-        if team_table is not None:
-            await _check_team_key_limits(
-                team_table=team_table,
-                data=data,
-                prisma_client=prisma_client,
-            )
-            from litellm.proxy.proxy_server import llm_router
-
-            await _validate_key_models_against_team(
-                models=data.models,
-                team_object=team_table,
-                llm_router=llm_router,
-            )
-
         # Validate key against project limits if project_id is set
         if data.project_id is not None:
             await _check_project_key_limits(
@@ -1974,20 +1993,6 @@ async def generate_service_account_key_fn(
         except Exception as e:
             verbose_proxy_logger.debug("Error getting team object in `/key/generate`: %s", e)
             team_table = None
-
-    if team_table is not None:
-        await _check_team_key_limits(
-            team_table=team_table,
-            data=data,
-            prisma_client=prisma_client,
-        )
-        from litellm.proxy.proxy_server import llm_router
-
-        await _validate_key_models_against_team(
-            models=data.models,
-            team_object=team_table,
-            llm_router=llm_router,
-        )
 
     key_generation_check(
         team_table=team_table,
@@ -2373,10 +2378,11 @@ async def _process_single_key_update(
         )
 
         if team_obj is not None and prisma_client is not None:
-            await _check_team_key_limits(
+            await _check_team_key_limits_and_models(
                 team_table=team_obj,
                 data=update_key_request,
                 prisma_client=prisma_client,
+                llm_router=llm_router,
             )
 
     # Validate team change if team is being changed
@@ -2658,17 +2664,12 @@ async def _validate_update_key_data(
             )
 
         if team_obj is not None:
-            await _check_team_key_limits(
+            await _check_team_key_limits_and_models(
                 team_table=team_obj,
                 data=data,
                 prisma_client=prisma_client,
+                llm_router=llm_router,
             )
-            if data.models is not None:
-                await _validate_key_models_against_team(
-                    models=data.models,
-                    team_object=team_obj,
-                    llm_router=llm_router,
-                )
 
     TeamMemberPermissionChecks.enforce_member_can_assign_access_groups(
         user_api_key_dict=user_api_key_dict,
