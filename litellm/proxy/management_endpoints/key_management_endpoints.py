@@ -1411,6 +1411,29 @@ _INHERITED_MODEL_SENTINELS: Final = frozenset(
 )
 
 
+async def _validate_key_models_against_team(
+    models: list[str] | None,
+    team_object: LiteLLM_TeamTable | LiteLLM_TeamTableCachedObj,
+    llm_router: Router | None,
+) -> None:
+    """
+    Ensure each explicitly listed key model is allowed by the team's catalog.
+
+    Empty or unset model lists inherit the team scope at request time and are
+    not validated here. Sentinel values such as all-team-models are skipped.
+    """
+    if not models:
+        return
+    for model in models:
+        if model in _INHERITED_MODEL_SENTINELS:
+            continue
+        await can_team_access_model(
+            model=model,
+            team_object=team_object,
+            llm_router=llm_router,
+        )
+
+
 async def _check_project_key_limits(
     project_id: str,
     data: GenerateKeyRequest | UpdateKeyRequest,
@@ -1787,6 +1810,13 @@ async def generate_key_fn(
                 data=data,
                 prisma_client=prisma_client,
             )
+            from litellm.proxy.proxy_server import llm_router
+
+            await _validate_key_models_against_team(
+                models=data.models,
+                team_object=team_table,
+                llm_router=llm_router,
+            )
 
         # Validate key against project limits if project_id is set
         if data.project_id is not None:
@@ -1950,6 +1980,13 @@ async def generate_service_account_key_fn(
             team_table=team_table,
             data=data,
             prisma_client=prisma_client,
+        )
+        from litellm.proxy.proxy_server import llm_router
+
+        await _validate_key_models_against_team(
+            models=data.models,
+            team_object=team_table,
+            llm_router=llm_router,
         )
 
     key_generation_check(
@@ -2361,6 +2398,7 @@ async def _process_single_key_update(
             team=team_obj,
             change_initiated_by=user_api_key_dict,
             llm_router=llm_router,
+            models=update_key_request.models if "models" in update_key_request.model_fields_set else None,
         )
 
     # Prepare update data
@@ -2625,6 +2663,12 @@ async def _validate_update_key_data(
                 data=data,
                 prisma_client=prisma_client,
             )
+            if data.models is not None:
+                await _validate_key_models_against_team(
+                    models=data.models,
+                    team_object=team_obj,
+                    llm_router=llm_router,
+                )
 
     TeamMemberPermissionChecks.enforce_member_can_assign_access_groups(
         user_api_key_dict=user_api_key_dict,
@@ -2701,6 +2745,7 @@ async def _validate_update_key_data(
             team=team_obj,
             change_initiated_by=user_api_key_dict,
             llm_router=llm_router,
+            models=data.models if "models" in data.model_fields_set else None,
         )
 
     # Validate MCP servers in object_permission against the effective team
@@ -3328,6 +3373,7 @@ async def validate_key_team_change(
     team: LiteLLM_TeamTable,
     change_initiated_by: UserAPIKeyAuth,
     llm_router: Router,
+    models: list[str] | None = None,
 ):
     """
     Validate that a key can be moved to a new team.
@@ -3337,18 +3383,14 @@ async def validate_key_team_change(
     - The key's tpm/rpm limit must be less than the team's tpm/rpm limit
     - The person initiating the change must be either Proxy Admin or Team Admin
     """
-    # Check if the team has access to the key's models
-    if len(key.models) > 0:
-        for model in key.models:
-            # Skip special sentinel values — "all-team-models" means
-            # "use whatever the team allows", so it's always valid.
-            if model == SpecialModelNames.all_team_models.value:
-                continue
-            await can_team_access_model(
-                model=model,
-                team_object=team,
-                llm_router=llm_router,
-            )
+    # When models are supplied in the same update, validate the resulting list
+    # rather than the key's pre-update models.
+    models_to_validate: Final = models if models is not None else key.models
+    await _validate_key_models_against_team(
+        models=models_to_validate,
+        team_object=team,
+        llm_router=llm_router,
+    )
 
     # Check if the key's tpm/rpm limit is less than the team's tpm/rpm limit
     if key.tpm_limit is not None:
